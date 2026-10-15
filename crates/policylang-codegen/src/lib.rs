@@ -24,7 +24,7 @@ use policylang_ast::spec::{LogicProfile, Spec};
 use policylang_check::{CheckedSpec, SymbolTable};
 
 pub use division::{collect_div_obligations, linearize_formula};
-pub use emit::{EmittedQuery, Emitter, ExpectedVerdict, SymbolDecl};
+pub use emit::{EmittedQuery, Emitter, EnumEncoding, ExpectedVerdict, SymbolDecl};
 pub use ground::{ground, Grounder};
 
 /// 域规模查询（展开器所需的最小接口，避免展开器依赖整个符号表）。
@@ -48,6 +48,8 @@ pub struct CodegenOptions {
     pub emit_bounds: bool,
     /// 展开硬上限（与检查期 `G_max` 对齐，作为内存安全的第二道闸门）。
     pub hard_cap: usize,
+    /// 枚举编码方式（`DD-6.2`）。默认 `Int`；`Datatype` 为保留开关。
+    pub enum_encoding: EnumEncoding,
 }
 
 impl Default for CodegenOptions {
@@ -55,6 +57,7 @@ impl Default for CodegenOptions {
         CodegenOptions {
             emit_bounds: true,
             hard_cap: 4_000_000,
+            enum_encoding: EnumEncoding::default(),
         }
     }
 }
@@ -145,12 +148,30 @@ pub fn generate(
     }
 
     // ── 逐 verify 生成查询 ──
-    let em = Emitter::new(spec, tab, header.to_string());
+    let mut em = Emitter::new(spec, tab, header.to_string())
+        .with_enum_encoding(opts.enum_encoding);
+    em.emit_bounds = opts.emit_bounds;
     let mut queries: Vec<EmittedQuery> = Vec::new();
     let mut obligations: BTreeMap<String, Vec<Expr>> = BTreeMap::new();
 
+    // ── 声明足迹（`06 §6.2.2`）────────────────────────────────────────────────
+    // 发射器按固定顺序声明**全部**全局变量与域实例字段（规范不做符号剪枝），
+    // 因此每个查询的逻辑档位必须覆盖**已声明符号的排序**，而不只是公式中出现的排序。
+    //
+    // 反例（真实缺陷）：`cloud-deployment.plm` 的 `refines` 查询只用到 `Int`/`Bool`，
+    // 但其脚本仍声明了 `IPv4`（`(_ BitVec 32)`）与 `String` 字段；若按公式足迹推出
+    // `QF_LIA`，就会产出 `(set-logic QF_LIA)` + 未知排序声明的**非法脚本**。
+    // 实测 z3/cvc5 对未知排序报 `(error …)` 并**静默丢弃**该声明及其依赖断言，
+    // 随后仍对残余断言给出 `unsat` ⇒ 可能产出**假证明**（正面违背 `G-4` / `G-8`）。
+    let mut decl_profile = LogicProfile::default();
+    for d in em.decls() {
+        policylang_check::logic_profile::mark_sort(&mut decl_profile, &d.sort);
+    }
+
     let logic_of = |checked: &CheckedSpec, names: &[&str]| -> String {
         let mut p = LogicProfile::default();
+        // 先并入声明足迹，再并入公式足迹（两者取并集取最保守档位）
+        p.merge_from(&decl_profile);
         for n in names {
             if let Some(x) = checked.policy_profiles.get(*n) {
                 p.merge_from(x);
@@ -158,6 +179,11 @@ pub fn generate(
             if let Some(x) = checked.invariant_profiles.get(*n) {
                 p.merge_from(x);
             }
+        }
+        if opts.enum_encoding == EnumEncoding::Datatype && p.uses_enum {
+            // datatype 编码使逻辑离开 `QF_*` 标准集（`DD-6.2` 已登记的代价）：
+            // datatype 属 `QF_UFDT` / `ALL`，故直接给出 `ALL`。
+            return "ALL".to_string();
         }
         p.candidate_logic().to_string()
     };
@@ -426,6 +452,111 @@ mod integration_tests {
         assert!(q.script.contains("(< 0 PL_g_d)"), "{}", q.script);
         assert!(q.script.contains("(or "), "{}", q.script);
         assert_eq!(q.logic, "QF_LIA");
+    }
+
+    #[test]
+    fn enum_bound_assert_is_not_double_parenthesised() {
+        // 回归（真实缺陷）：`join("or", …)` **自带外层括号**，若再包一层会产出
+        // `(assert ((or (= x 0) …)))`。实测 z3 报 `invalid function application` 并
+        // **丢弃该断言** ⇒ 枚举变量退化为无界 `Int`，可能产出**假证明**。
+        let (out, _) = codegen(
+            "entity E { k: Enum { A, B, C }, n: Int }\ndomain D: Set[E] [size: 1]\n\
+             policy P { rule R: forall s in D: s.n >= 0 }\nverify consistency of P\n",
+        );
+        let q = &out.queries[0];
+        // 枚举成员闭包必须被发射
+        assert!(q.script.contains("(= PL_D_0_k 0)"), "{}", q.script);
+        // 且**不得**出现双括号
+        assert!(!q.script.contains("((or"), "出现双括号：{}", q.script);
+        // 良构性：括号配平
+        assert_eq!(
+            q.script.matches('(').count(),
+            q.script.matches(')').count(),
+            "括号不配平：{}",
+            q.script
+        );
+    }
+
+    #[test]
+    fn datatype_enum_encoding_emits_type_decls_and_ctors() {
+        // `DD-6.2` 的保留开关：`declare-datatype` 代数数据类型编码
+        let src = "entity E { k: Enum { A, B, C }, n: Int }\ndomain D: Set[E] [size: 1]\n\
+                   policy P { rule R: forall s in D: s.n >= 0 }\nverify consistency of P\n";
+
+        // ① 默认：有界整数编码 + 成员闭包断言
+        let (out_int, _) = codegen(src);
+        let qi = &out_int.queries[0];
+        assert!(qi.script.contains("(declare-fun PL_D_0_k () Int)"), "{}", qi.script);
+        assert!(qi.script.contains("(= PL_D_0_k 0)"), "{}", qi.script);
+        assert!(!qi.script.contains("declare-datatype"), "{}", qi.script);
+        assert_eq!(qi.logic, "QF_LIA");
+
+        // ② datatype：类型 + 零元构造子，且**无**成员闭包断言
+        let spec = spec_of(src);
+        let checked = check(&spec, &CheckOptions::default()).unwrap();
+        let opts = CodegenOptions {
+            enum_encoding: EnumEncoding::Datatype,
+            ..CodegenOptions::default()
+        };
+        let out = generate(&checked, "T", &opts).unwrap();
+        let q = &out.queries[0];
+        assert!(
+            q.script
+                .contains("(declare-datatype PL_T_A_B_C ((PL_M_A) (PL_M_B) (PL_M_C)))"),
+            "{}",
+            q.script
+        );
+        assert!(
+            q.script.contains("(declare-fun PL_D_0_k () PL_T_A_B_C)"),
+            "{}",
+            q.script
+        );
+        // 闭集类型 ⇒ 不发射成员闭包
+        assert!(!q.script.contains("(or (= PL_D_0_k 0)"), "{}", q.script);
+        // datatype 属 `QF_UFDT`/`ALL` ⇒ 档位必须离开 `QF_*`
+        assert_eq!(q.logic, "ALL", "{}", q.script);
+        // 类型声明必须先于使用它的常量声明
+        let dt = q.script.find("declare-datatype").expect("应有类型声明");
+        let df = q.script.find("(declare-fun").expect("应有常量声明");
+        assert!(dt < df, "declare-datatype 必须早于 declare-fun");
+    }
+
+    #[test]
+    fn datatype_encoding_uses_ctor_names_for_members() {
+        let src = "entity E { k: Enum { A, B } }\ndomain D: Set[E] [size: 1]\n\
+                   policy P { rule R: forall s in D: s.k == B }\nverify consistency of P\n";
+        let spec = spec_of(src);
+        let checked = check(&spec, &CheckOptions::default()).unwrap();
+        let opts = CodegenOptions {
+            enum_encoding: EnumEncoding::Datatype,
+            ..CodegenOptions::default()
+        };
+        let out = generate(&checked, "T", &opts).unwrap();
+        let q = &out.queries[0];
+        // 成员引用必须变成零元构造子，而非整数下标
+        assert!(q.script.contains("PL_M_B"), "{}", q.script);
+        assert!(!q.script.contains("PL_D_0_k 1)"), "{}", q.script);
+    }
+
+    #[test]
+    fn query_logic_covers_all_declared_sorts() {
+        // 回归（真实缺陷）：发射器按 `06 §6.2.2` 声明**全部**符号，因此查询档位必须覆盖
+        // **已声明符号的排序**。早期只按公式足迹推导 ⇒ 产出
+        // `(set-logic QF_LIA)` + `(_ BitVec 32)` / `String` 声明的**非法脚本**，
+        // 实测 z3/cvc5 报 `unknown sort` 并**静默丢弃**声明与其依赖断言（假证明风险）。
+        let (out, checked) = codegen(
+            "entity E { ip: IPv4, name: String [length: 1..8], a: Int }\n\
+             domain D: Set[E] [size: 1]\n\
+             policy P { rule R: forall s in D: s.a >= 0 }\nverify consistency of P\n",
+        );
+        // 公式足迹本身只有 `Int` ⇒ 检查器给出的**策略**档位仍是 `QF_LIA`
+        assert_eq!(checked.logic_of_policy("P"), "QF_LIA");
+        // 但**查询**档位必须升级到能覆盖 `BV` + `String` + `Int` 的组合
+        let q = &out.queries[0];
+        assert_eq!(q.logic, "ALL", "{}", q.script);
+        assert!(q.script.contains("(set-logic ALL)"), "{}", q.script);
+        assert!(q.script.contains("(_ BitVec 32)"), "{}", q.script);
+        assert!(q.script.contains("() String)"), "{}", q.script);
     }
 
     #[test]

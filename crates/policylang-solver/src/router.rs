@@ -208,6 +208,7 @@ mod tests {
             f_div_mod: true,
             f_regex_inter: true,
             f_proof: false,
+            f_optimize: false,
             notes: vec![],
         }
     }

@@ -1,0 +1,23 @@
+# policylang.lock —— 由 `policylang lock` 生成，请勿手工编辑（06 §6.5.2）
+lock_version = 1
+
+[[solver]]
+name = "z3"
+version = "5.3.0"
+binary_sha256 = "bae49878203139553a4a580d99ff505d030091640425c54b7297c96898cb20b3"
+path = "~/.local/share/policylang-solvers/z3/z3-5.3.0-x64-win/bin/z3.exe"
+required = true
+
+[[solver]]
+name = "cvc5"
+version = "1.4.2"
+binary_sha256 = "868a0d7a5e3acba7d7e71b95c7a7f89fdc7b82d1ab8d2ea4a84ff067274bdf5a"
+path = "~/.local/share/policylang-solvers/cvc5/cvc5-Win64-x86_64-static/bin/cvc5.exe"
+required = true
+
+[[solver]]
+name = "bitwuzla"
+version = "0.9.1"
+binary_sha256 = "ce880e5402abc0df542b8c1f9f65e57ba9353690848d3f2d69054ff2f29cc796"
+path = "~/.local/share/policylang-solvers/bitwuzla/Bitwuzla-Win64-x86_64-static/bin/bitwuzla.exe"
+required = true

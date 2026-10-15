@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use crate::orchestra::{run_captured, Backend};
+use crate::orchestra::{run_captured, run_captured_argv, Backend, ProcResult};
 use crate::response::{parse_responses, Verdict};
 
 /// 一个后端的能力画像。
@@ -24,6 +24,9 @@ pub struct Capability {
     pub f_div_mod: bool,
     pub f_regex_inter: bool,
     pub f_proof: bool,
+    /// 是否支持 **Optimize 扩展**（`(minimize)`/`(maximize)` + `:opt.priority box`）。
+    /// 供反例区间化使用（`06 §6.3.7`）；不支持时区间化优雅降级。
+    pub f_optimize: bool,
     /// 探测中的失败说明（供诊断）。
     pub notes: Vec<String>,
 }
@@ -42,6 +45,7 @@ impl Capability {
             f_div_mod: false,
             f_regex_inter: false,
             f_proof: false,
+            f_optimize: false,
             notes: vec![why.to_string()],
         }
     }
@@ -86,7 +90,8 @@ pub fn capability_json(caps: &[Capability]) -> String {
         s.push_str(&format!("      \"f_incremental\": {},\n", c.f_incremental));
         s.push_str(&format!("      \"f_div_mod\": {},\n", c.f_div_mod));
         s.push_str(&format!("      \"f_regex_inter\": {},\n", c.f_regex_inter));
-        s.push_str(&format!("      \"f_proof\": {}\n", c.f_proof));
+        s.push_str(&format!("      \"f_proof\": {},\n", c.f_proof));
+        s.push_str(&format!("      \"f_optimize\": {}\n", c.f_optimize));
         s.push_str(if i + 1 == caps.len() { "    }\n" } else { "    },\n" });
     }
     s.push_str("  ]\n}\n");
@@ -124,6 +129,7 @@ pub fn probe_backend(b: &Backend, timeout: Duration) -> Capability {
         f_div_mod: false,
         f_regex_inter: false,
         f_proof: false,
+        f_optimize: false,
         notes: Vec::new(),
     };
 
@@ -142,101 +148,301 @@ pub fn probe_backend(b: &Backend, timeout: Duration) -> Capability {
         .filter(|l| !l.is_empty());
     cap.available = true;
 
-    // P2：逐档位冒烟
+    // P2：逐档位冒烟（**每个档位使用该档位合法的脚本**，见 `logic_sample`）
     for logic in CANDIDATE_LOGICS {
-        if smoke_logic(&b.path, logic, timeout) {
+        if smoke_logic(b, logic, timeout) {
             cap.logics.insert((*logic).to_string());
         }
     }
-    // `ALL`：无 `set-logic` 的通用档位（多数求解器默认允许）
-    if smoke_logic(&b.path, "ALL", timeout) {
+    // `ALL`：允许全部理论的通用档位
+    if smoke_logic(b, "ALL", timeout) {
         cap.logics.insert("ALL".to_string());
     }
 
-    // P3：特性位
-    cap.f_model = probe_model(&b.path, timeout);
-    cap.f_unsat_core = probe_unsat_core(&b.path, timeout);
-    cap.f_incremental = probe_incremental(&b.path, timeout);
-    cap.f_div_mod = probe_div_mod(&b.path, timeout);
-    cap.f_regex_inter = probe_regex_inter(&b.path, timeout);
-    cap.f_proof = probe_proof(&b.path, timeout);
+    // P3：特性位（**在已实测支持的档位上探测**，避免用后端不支持的档位去问特性）
+    cap.f_model = probe_over(b, &cap, FEATURE_CANDS, timeout, model_script, |p| {
+        p.verdict() == Some(Verdict::Sat) && p.model().is_some_and(|m| !m.is_empty())
+    });
+    cap.f_unsat_core = probe_over(b, &cap, FEATURE_CANDS, timeout, core_script, |p| {
+        p.verdict() == Some(Verdict::Unsat) && p.core().is_some_and(|c| !c.is_empty())
+    });
+    cap.f_incremental = probe_over(b, &cap, FEATURE_CANDS, timeout, incr_script, |p| {
+        p.responses
+            .iter()
+            .filter(|x| matches!(x, crate::response::Response::Verdict(_)))
+            .count()
+            == 2
+    });
+    // `div`/`mod` 仅按 `Int` 族探测：本框架的除法线性化（`TH-4`）只对整数除法发射，
+    // 故位向量后端的该位保守为 `false`（诚实刻画，避免路由器误判）。
+    cap.f_div_mod = probe_over(b, &cap, INT_CANDS, timeout, divmod_script, |p| {
+        p.verdict().is_some_and(Verdict::is_determinate)
+    });
+    // `re.inter` 属字串理论，只在字串档位上探测。
+    cap.f_regex_inter = probe_over(b, &cap, STRING_CANDS, timeout, regex_script, |p| {
+        p.verdict().is_some_and(Verdict::is_determinate)
+    });
+    cap.f_proof = probe_over(b, &cap, FEATURE_CANDS, timeout, proof_script, |p| {
+        p.verdict() == Some(Verdict::Unsat)
+    });
+    // `Optimize` 扩展（供反例区间化，`06 §6.3.7`）：只用 `Int` 族探测——
+    // 本框架的区间化只作用于连续排序，用位向量探测会把「BV 可优化」误记为「连续排序可优化」。
+    cap.f_optimize = probe_optimize(b, &cap, timeout);
     cap
 }
 
-/// `P2`：单档位冒烟脚本。
-fn smoke_logic(path: &str, logic: &str, timeout: Duration) -> bool {
-    let script = format!(
-        "(set-logic {logic})\n\
-         (declare-fun pl_probe_int () Int)\n\
-         (declare-fun pl_probe_bv  () (_ BitVec 8))\n\
-         (declare-fun pl_probe_str () String)\n\
-         (assert (= pl_probe_int 0))\n\
-         (assert (= (bvand pl_probe_bv (_ bv1 8)) (_ bv1 8)))\n\
-         (assert (str.in_re pl_probe_str (re.inter (re.* re.allchar) (re.range \"a\" \"z\"))))\n\
+/// 探测 Optimize 扩展（`(minimize)`/`(maximize)` + `:opt.priority box`）。
+///
+/// 判据：`check-sat` 为 `sat`，**且**能从 `(get-objectives)` 中取回目标字段的值——
+/// 后者是关键：部分求解器接受 `minimize` 语法却不返回目标（则区间化不可用）。
+fn probe_optimize(b: &Backend, cap: &Capability, timeout: Duration) -> bool {
+    for lg in INT_CANDS {
+        if !cap.logics.contains(*lg) {
+            continue;
+        }
+        let script = format!(
+            "(set-logic {lg})\n(set-option :opt.priority box)\n\
+             (declare-fun x () Int)\n(assert (>= x 0))\n(assert (<= x 10))\n\
+             (minimize x)\n(maximize x)\n(check-sat)\n(get-objectives)\n"
+        );
+        let r = exec(b, &script, timeout);
+        if r.timed_out || r.spawn_error.is_some() {
+            continue;
+        }
+        let p = parse_responses(&r.stdout);
+        if !p.unexpected_errors().is_empty() {
+            continue;
+        }
+        if p.verdict() == Some(Verdict::Sat)
+            && crate::interval::interval_from_objectives(&r.stdout, "x").is_some()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// 特性探测的**候选档位顺序**：先试 `Int` 族（本框架主用），再试位向量族，
+/// 最后才用通用档位 `ALL`（`ALL` 最宽松，故放最后以免夸大能力）。
+const FEATURE_CANDS: &[&str] = &[
+    "QF_LIA", "QF_LIRA", "QF_LRA", "QF_BVLIA", "QF_BV", "QF_BVLRA", "QF_BVLIRA", "QF_SLIA", "ALL",
+];
+
+/// 仅 `Int` 族（用于 `div`/`mod`）。
+const INT_CANDS: &[&str] = &["QF_LIA", "QF_LIRA", "QF_LRA", "QF_SLIA", "ALL"];
+
+/// 仅字串族（用于 `re.inter`）。
+const STRING_CANDS: &[&str] = &["QF_SLIA", "ALL"];
+
+/// 在**后端已实测支持**的档位上依次尝试特性探测；任一成功即判该特性可用。
+///
+/// 逐档位而非固定单档位的原因：仅位向量的后端（bitwuzla）在 `QF_LIA` 下会直接拒绝，
+/// 若用固定档位探测会把它的 `model`/`unsat-core` 等真实能力**误判为不支持**。
+fn probe_over(
+    b: &Backend,
+    cap: &Capability,
+    cands: &[&str],
+    timeout: Duration,
+    mk: fn(&str) -> Option<String>,
+    check: impl Fn(&crate::response::ParsedOutput) -> bool,
+) -> bool {
+    for lg in cands {
+        if !cap.logics.contains(*lg) {
+            continue; // 该档位未被实测支持，跳过（不猜测）
+        }
+        let Some(script) = mk(lg) else { continue };
+        let r = exec(b, &script, timeout);
+        if r.timed_out || r.spawn_error.is_some() {
+            continue;
+        }
+        let p = parse_responses(&r.stdout);
+        if !p.unexpected_errors().is_empty() {
+            continue; // 该档位下脚本被拒 ⇒ 换下一个档位
+        }
+        if check(&p) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 该档位下「一个标量符号声明 + 一个可满足等式」。
+fn scalar(lg: &str) -> (String, String) {
+    if is_bv_family(lg) {
+        (
+            "(declare-fun b () (_ BitVec 8))\n".to_string(),
+            "(= b (_ bv7 8))".to_string(),
+        )
+    } else {
+        (
+            "(declare-fun x () Int)\n".to_string(),
+            "(= x 7)".to_string(),
+        )
+    }
+}
+
+/// 该档位是否属于位向量族（决定用 `BitVec` 还是 `Int` 造样例）。
+fn is_bv_family(lg: &str) -> bool {
+    matches!(lg, "QF_BV" | "QF_BVLIA" | "QF_BVLRA" | "QF_BVLIRA")
+}
+
+fn model_script(lg: &str) -> Option<String> {
+    let (decl, eq) = scalar(lg);
+    Some(format!(
+        "(set-logic {lg})\n(set-option :produce-models true)\n{decl}\
+         (assert {eq})\n(check-sat)\n(get-model)\n"
+    ))
+}
+
+/// 一对**互斥**的具名断言（必然 `unsat`），用于核与证明探测。
+fn core_script(lg: &str) -> Option<String> {
+    let decl: String;
+    let (a, b): (&str, &str) = if is_bv_family(lg) {
+        decl = "(declare-fun b () (_ BitVec 8))\n".to_string();
+        ("(= b (_ bv1 8))", "(= b (_ bv2 8))")
+    } else {
+        decl = "(declare-fun x () Int)\n".to_string();
+        ("> x 10", "< x 5")
+    };
+    Some(format!(
+        "(set-logic {lg})\n(set-option :produce-unsat-cores true)\n{decl}\
+         (assert (! {a} :named A))\n(assert (! {b} :named B))\n(check-sat)\n(get-unsat-core)\n"
+    ))
+}
+
+fn incr_script(lg: &str) -> Option<String> {
+    let (decl, v1, v2): (&str, &str, &str) = if is_bv_family(lg) {
+        (
+            "(declare-fun b () (_ BitVec 8))\n",
+            "(_ bv1 8)",
+            "(_ bv2 8)",
+        )
+    } else {
+        ("(declare-fun x () Int)\n", "1", "2")
+    };
+    let sym = if is_bv_family(lg) { "b" } else { "x" };
+    Some(format!(
+        "(set-logic {lg})\n{decl}\
+         (push 1)\n(assert (= {sym} {v1}))\n(check-sat)\n\
+         (pop 1)\n(assert (= {sym} {v2}))\n(check-sat)\n"
+    ))
+}
+
+fn divmod_script(lg: &str) -> Option<String> {
+    if is_bv_family(lg) {
+        Some(format!(
+            "(set-logic {lg})\n(declare-fun b () (_ BitVec 8))\n\
+             (assert (= (bvudiv b (_ bv2 8)) (_ bv1 8)))\n(check-sat)\n"
+        ))
+    } else {
+        Some(format!(
+            "(set-logic {lg})\n(declare-fun x () Int)\n\
+             (assert (= (div x 3) 2))\n(check-sat)\n"
+        ))
+    }
+}
+
+fn regex_script(lg: &str) -> Option<String> {
+    Some(format!(
+        "(set-logic {lg})\n(declare-fun s () String)\n\
+         (assert (str.in_re s (re.inter (re.* re.allchar) (re.range \"a\" \"z\"))))\n\
          (check-sat)\n"
-    );
-    let r = run_captured(path, &["-in"], Some(&script), timeout);
+    ))
+}
+
+fn proof_script(lg: &str) -> Option<String> {
+    // 复用「一对互斥具名断言」的骨架，替换选项与查询命令
+    let base = core_script(lg)?;
+    Some(
+        base.replace(
+            "(set-option :produce-unsat-cores true)",
+            "(set-option :produce-proofs true)",
+        )
+        .replace("(get-unsat-core)", "(get-proof)"),
+    )
+}
+
+/// 执行一次 stdin 投喂（统一走 [`crate::invocation::stdin_argv`] 合成命令行）。
+///
+/// **不要**在此处硬编码 argv：三款后端的 stdin 约定互不相同（`06 §6.5.1`）。
+fn exec(b: &Backend, script: &str, timeout: Duration) -> ProcResult {
+    let argv = crate::invocation::stdin_argv(&b.name, Some(timeout));
+    run_captured_argv(&b.path, &argv, Some(script), timeout)
+}
+
+/// 某逻辑档位的**最小合法冒烟脚本**。
+///
+/// ## 为何必须按档位定制
+/// 早期实现对**所有**档位投喂同一个「`Int` + `BitVec` + `String` + `re.inter`」单体脚本，
+/// 于是 `QF_LIA` / `QF_BV` / `QF_UF` 等**必然失败**（脚本本身在该档位下不合法），
+/// 只有 `ALL` 能通过——`ALG-3` 的能力矩阵实际退化为「后端是否支持 `ALL`」，
+/// 与 `FR-17`「理论感知路由」的初衷相反。
+///
+/// 本函数为每个档位给出**只使用该档位允许理论**的脚本。`QF_BVLIA` / `QF_BVLRA` /
+/// `QF_BVLIRA` 只要求「同时出现对应排序」而不要求二者真正混合——判定的是**档位是否可被接受**。
+fn logic_sample(logic: &str) -> Option<String> {
+    let s = match logic {
+        "QF_UF" => {
+            "(set-logic QF_UF)\n(declare-fun p () Bool)\n(declare-fun f (Bool) Bool)\n\
+             (assert (f p))\n(check-sat)\n"
+        }
+        "QF_LIA" => {
+            "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (= (+ x 1) 3))\n(check-sat)\n"
+        }
+        "QF_LRA" => {
+            "(set-logic QF_LRA)\n(declare-fun r () Real)\n\
+             (assert (= (* r 2.0) 3.0))\n(check-sat)\n"
+        }
+        "QF_LIRA" => {
+            "(set-logic QF_LIRA)\n(declare-fun x () Int)\n(declare-fun r () Real)\n\
+             (assert (= (to_real x) r))\n(assert (> r 0.0))\n(check-sat)\n"
+        }
+        "QF_BV" => {
+            "(set-logic QF_BV)\n(declare-fun b () (_ BitVec 8))\n\
+             (assert (= (bvadd b (_ bv1 8)) (_ bv0 8)))\n(check-sat)\n"
+        }
+        "QF_BVLIA" => {
+            "(set-logic QF_BVLIA)\n(declare-fun b () (_ BitVec 8))\n(declare-fun x () Int)\n\
+             (assert (= b (_ bv7 8)))\n(assert (> x 0))\n(check-sat)\n"
+        }
+        "QF_BVLRA" => {
+            "(set-logic QF_BVLRA)\n(declare-fun b () (_ BitVec 8))\n(declare-fun r () Real)\n\
+             (assert (= b (_ bv7 8)))\n(assert (> r 0.0))\n(check-sat)\n"
+        }
+        "QF_BVLIRA" => {
+            "(set-logic QF_BVLIRA)\n(declare-fun b () (_ BitVec 8))\n(declare-fun x () Int)\n\
+             (declare-fun r () Real)\n(assert (= b (_ bv7 8)))\n\
+             (assert (= (to_real x) r))\n(check-sat)\n"
+        }
+        "QF_SLIA" => {
+            "(set-logic QF_SLIA)\n(declare-fun s () String)\n\
+             (assert (str.contains s \"a\"))\n(check-sat)\n"
+        }
+        "ALL" => {
+            "(set-logic ALL)\n(declare-fun x () Int)\n(declare-fun b () (_ BitVec 8))\n\
+             (declare-fun s () String)\n(assert (> x 0))\n(assert (= b (_ bv1 8)))\n\
+             (assert (str.contains s \"a\"))\n(check-sat)\n"
+        }
+        _ => return None,
+    };
+    Some(s.to_string())
+}
+
+/// `P2`：单档位冒烟。
+///
+/// 判据：脚本**被接受且被求解**——判定为 `sat` 或 `unsat` 均可（二者都证明该档位可用），
+/// 但 `unknown`、超时、启动失败、或任何 `(error …)` 都判为**不支持**（保守，`TH-3a`）。
+fn smoke_logic(b: &Backend, logic: &str, timeout: Duration) -> bool {
+    let Some(script) = logic_sample(logic) else {
+        return false;
+    };
+    let r = exec(b, &script, timeout);
     if r.timed_out || r.spawn_error.is_some() {
         return false;
     }
     let p = parse_responses(&r.stdout);
-    // 期望序列**首项**为 sat，且无 `(error …)`
-    p.verdict() == Some(Verdict::Sat) && p.errors().is_empty()
-}
-
-fn probe_model(path: &str, timeout: Duration) -> bool {
-    let script = "(set-logic QF_LIA)\n(set-option :produce-models true)\n\
-                  (declare-fun x () Int)\n(assert (= x 7))\n(check-sat)\n(get-model)\n";
-    let r = run_captured(path, &["-in"], Some(script), timeout);
-    let p = parse_responses(&r.stdout);
-    p.verdict() == Some(Verdict::Sat) && p.model().map(|m| !m.is_empty()).unwrap_or(false)
-}
-
-fn probe_unsat_core(path: &str, timeout: Duration) -> bool {
-    let script = "(set-logic QF_LIA)\n(set-option :produce-unsat-cores true)\n\
-                  (declare-fun x () Int)\n\
-                  (assert (! (> x 10) :named A))\n(assert (! (< x 5) :named B))\n\
-                  (check-sat)\n(get-unsat-core)\n";
-    let r = run_captured(path, &["-in"], Some(script), timeout);
-    let p = parse_responses(&r.stdout);
-    p.verdict() == Some(Verdict::Unsat) && p.core().map(|c| !c.is_empty()).unwrap_or(false)
-}
-
-fn probe_incremental(path: &str, timeout: Duration) -> bool {
-    let script = "(set-logic QF_LIA)\n(declare-fun x () Int)\n\
-                  (push 1)\n(assert (= x 1))\n(check-sat)\n(pop 1)\n(assert (= x 2))\n(check-sat)\n";
-    let r = run_captured(path, &["-in"], Some(script), timeout);
-    let p = parse_responses(&r.stdout);
-    // 期望**两次**判定
-    let n = p
-        .responses
-        .iter()
-        .filter(|x| matches!(x, crate::response::Response::Verdict(_)))
-        .count();
-    n == 2
-}
-
-fn probe_div_mod(path: &str, timeout: Duration) -> bool {
-    let script = "(set-logic QF_LIA)\n(declare-fun x () Int)\n(assert (= (div x 3) 2))\n(check-sat)\n";
-    let r = run_captured(path, &["-in"], Some(script), timeout);
-    parse_responses(&r.stdout).verdict() == Some(Verdict::Sat)
-}
-
-fn probe_regex_inter(path: &str, timeout: Duration) -> bool {
-    let script = "(set-logic QF_SLIA)\n(declare-fun s () String)\n\
-                  (assert (str.in_re s (re.inter (re.* re.allchar) (re.range \"a\" \"z\"))))\n\
-                  (check-sat)\n";
-    let r = run_captured(path, &["-in"], Some(script), timeout);
-    parse_responses(&r.stdout).verdict() == Some(Verdict::Sat)
-}
-
-fn probe_proof(path: &str, timeout: Duration) -> bool {
-    let script = "(set-logic QF_LIA)\n(set-option :produce-proofs true)\n\
-                  (declare-fun x () Int)\n(assert (! (> x 1) :named A))\n(assert (! (< x 0) :named B))\n\
-                  (check-sat)\n(get-proof)\n";
-    let r = run_captured(path, &["-in"], Some(script), timeout);
-    let p = parse_responses(&r.stdout);
-    p.verdict() == Some(Verdict::Unsat) && p.errors().is_empty()
+    // `06 §6.8.3`：只把**未预期**错误视为不支持（预期错配须忽略）
+    p.verdict().is_some_and(Verdict::is_determinate) && p.unexpected_errors().is_empty()
 }
 
 /// 探测全部后端。

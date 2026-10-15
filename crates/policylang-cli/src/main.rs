@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use policylang_check::CheckOptions;
 use policylang_governance::ExitCode;
-use policylang_solver::Confirmation;
+use policylang_codegen::EnumEncoding;
+use policylang_solver::{Confirmation, LockFile};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,6 +38,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         "fmt" => cmd_fmt(rest),
         "diff" => cmd_diff(rest),
         "solvers" => cmd_solvers(rest),
+        "lock" => cmd_lock(rest),
         "explain" => cmd_explain(rest),
         "init" => cmd_init(rest),
         "version" | "--version" | "-V" => {
@@ -63,6 +65,7 @@ fn print_usage() {
   fmt      <file.plm...>   源码规范化（--write 就地写回）\n\
   diff     --new A --old B <file.plm>   策略精化四态对比\n\
   solvers                  列出 ALG-3 实测能力矩阵\n\
+  lock     [--write <path>] [--required a,b]  生成 policylang.lock（06 §6.5.2）\n\
   explain  --goal <名> <file.plm>       解释某验证目标\n\
   init     [目录]          生成 policylang.toml 与示例\n\
   version / help\n\
@@ -86,6 +89,12 @@ verify 选项：\n\
   --mutex-max-pairs <n>    mutex 分支对数上限（默认 64）\n\
   --regex-budget <n>       单条正则转译预算（默认 4096）\n\
   --goal-parallelism <n>   目标级并行度（默认 1）\n\
+  --lock <path>            指定 policylang.lock（默认在 CWD 自动发现）\n\
+  --no-lock                跳过锁文件校验\n\
+  --allow-version-drift    版本/摘要漂移降级为警告（06 §6.5.2）\n\
+  --enum-encoding <int|datatype> 枚举编码（默认 int；DD-6.2 保留开关）\n\
+  --no-counterexample-interval   关闭反例区间化（默认开启；06 §6.3.7）\n\
+  --interval-budget <ms>         区间化总预算（默认 500）\n\
   --quiet                  不打印人类可读摘要"
         ,
         env!("CARGO_PKG_VERSION")
@@ -177,6 +186,28 @@ fn parse_verify(args: &[String]) -> Result<cmd_verify::VerifyOptions, String> {
                     .parse::<usize>()
                     .map_err(|_| "--goal-parallelism 期望整数".to_string())?
                     .max(1);
+            }
+            "--lock" => o.lock_file = Some(PathBuf::from(next(&mut i)?)),
+            "--no-lock" => o.no_lock = true,
+            "--allow-version-drift" => o.allow_version_drift = true,
+            "--enum-encoding" => {
+                let v = next(&mut i)?;
+                o.enum_encoding = match v.as_str() {
+                    "int" => EnumEncoding::Int,
+                    "datatype" => EnumEncoding::Datatype,
+                    _ => {
+                        return Err(format!(
+                            "--enum-encoding 只接受 int|datatype，得到 `{v}`（DD-6.2）"
+                        ))
+                    }
+                };
+            }
+            "--counterexample-interval" => o.counterexample_interval = true,
+            "--no-counterexample-interval" => o.counterexample_interval = false,
+            "--interval-budget" => {
+                o.interval_budget_ms = next(&mut i)?
+                    .parse()
+                    .map_err(|_| "--interval-budget 期望毫秒整数".to_string())?;
             }
             "--quiet" => o.quiet = true,
             other if other.starts_with("--") => {
@@ -403,18 +434,19 @@ fn cmd_solvers(args: &[String]) -> ExitCode {
         }
     }
     println!(
-        "\n特性位：model / unsat-core / incremental / div-mod / re.inter / proof"
+        "\n特性位：model / unsat-core / incremental / div-mod / re.inter / proof / optimize"
     );
     for c in &caps {
         println!(
-            "{:<10} {:>5} {:>10} {:>11} {:>8} {:>11} {:>6}",
+            "{:<10} {:>5} {:>10} {:>11} {:>8} {:>11} {:>6} {:>8}",
             c.name,
             yn(c.f_model),
             yn(c.f_unsat_core),
             yn(c.f_incremental),
             yn(c.f_div_mod),
             yn(c.f_regex_inter),
-            yn(c.f_proof)
+            yn(c.f_proof),
+            yn(c.f_optimize)
         );
     }
     println!("\n基线参考（06 §6.4.4，须以实测为准）：");
@@ -567,5 +599,90 @@ verify consistency of DeploymentPolicy
     );
     println!("已生成 {} 与 {}", cfg.display(), example.display());
     println!("下一步：policylang verify {}", example.display());
+    ExitCode::Pass
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// lock（policylang.lock 生成，06 §6.5.2）
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// 生成 `policylang.lock`：记录各后端的**规范化版本号**、**二进制 SHA-256** 与路径。
+///
+/// 选 `--write <path>` 落盘，否则打印到 stdout（便于 diff）。
+/// `--required a,b` 把指定后端标记为必需（缺失即 `E-SOLVER-MISSING`，exit 4）。
+fn cmd_lock(args: &[String]) -> ExitCode {
+    let mut out: Option<PathBuf> = None;
+    let mut names: Vec<String> = Vec::new();
+    let mut required: Vec<String> = Vec::new();
+    let mut timeout_ms: u64 = 3000;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        match a {
+            "--write" | "-w" | "--output" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => out = Some(PathBuf::from(p)),
+                    None => return exit::usage_error("`--write` 缺少路径"),
+                }
+            }
+            "--required" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => required.extend(
+                        v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                    ),
+                    None => return exit::usage_error("`--required` 缺少取值"),
+                }
+            }
+            "--timeout" => {
+                i += 1;
+                match args.get(i).map(|v| v.parse::<u64>()) {
+                    Some(Ok(ms)) if ms > 0 => timeout_ms = ms,
+                    _ => return exit::usage_error("`--timeout` 期望正整数（毫秒）"),
+                }
+            }
+            other if other.starts_with('-') => {
+                return exit::usage_error(&format!("未知选项 `{other}`（参见 `policylang help`）"))
+            }
+            n => names.push(n.to_string()),
+        }
+        i += 1;
+    }
+
+    let backends = cmd_verify::backends_from(&names);
+    let caps = policylang_solver::probe_all(&backends, Duration::from_millis(timeout_ms));
+
+    let mut lock = LockFile::from_capabilities(&caps);
+    for e in &mut lock.solvers {
+        if required.iter().any(|r| r == &e.name) {
+            e.required = true;
+        }
+    }
+
+    let available = caps.iter().filter(|c| c.available).count();
+    if available == 0 {
+        eprintln!(
+            "policylang: 警告：未探测到任何可用求解器——锁文件将只记录缺失状态（无约束力）。\n\
+             提示：`bash scripts/install-solvers.sh` 或设置 POLICYLANG_SOLVER_PATH。"
+        );
+    }
+
+    match &out {
+        Some(p) => {
+            if let Err(e) = lock.write(p) {
+                eprintln!("policylang: {e}");
+                return ExitCode::InternalError;
+            }
+            eprintln!(
+                "policylang: 已写入 {}（{} 个后端，{} 个可用）",
+                p.display(),
+                lock.solvers.len(),
+                available
+            );
+        }
+        None => print!("{}", lock.render()),
+    }
     ExitCode::Pass
 }

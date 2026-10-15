@@ -12,10 +12,13 @@ use policylang_ast::diag::Diagnostic;
 use policylang_ast::formula::Formula;
 use policylang_ast::spec::{TargetType, VerifyKind};
 use policylang_check::{check, CheckOptions, CheckedSpec};
-use policylang_codegen::{generate, CodegenOptions, CodegenOutput, EmittedQuery, ExpectedVerdict};
+use policylang_codegen::{
+    generate, CodegenOptions, CodegenOutput, EmittedQuery, EnumEncoding, ExpectedVerdict,
+};
 use policylang_diagnostics::{
     attribute_core, build_counterexample, minimize_core, render_fix, summary_for, template_for,
-    Counterexample, Remediation, RuleConflictSpan, SubsetVerdict, VerdictFeature,
+    Counterexample, FieldRange, Remediation, RuleConflictSpan, SubsetVerdict,
+    VerdictFeature,
 };
 use policylang_governance::report::{Check, ReportInput, VerificationReport};
 use policylang_governance::waiver::{self, WaiverOutcome};
@@ -24,7 +27,8 @@ use policylang_governance::{
     GateStatus,
 };
 use policylang_solver::{
-    probe_all, rebuild_script, route, solve_race, split_named_asserts, Backend, Capability,
+    excluded_backends, probe_all, rebuild_script, route, solve_race, split_named_asserts,
+    verify_lock, Backend, Capability, LockFile,
     Confirmation, RaceOptions, RouteOptions, Verdict,
 };
 
@@ -48,6 +52,18 @@ pub struct VerifyOptions {
     pub minimize_budget: usize,
     pub quiet: bool,
     pub goal_parallelism: usize,
+    /// `06 §6.5.2`：`policylang.lock` 路径（`None` 表示在 CWD 自动发现）。
+    pub lock_file: Option<PathBuf>,
+    /// 显式禁用锁文件校验。
+    pub no_lock: bool,
+    /// `--allow-version-drift`：把 `E-SOLVER-VERSION` 降级为 `W-SOLVER-DRIFT`。
+    pub allow_version_drift: bool,
+    /// 枚举编码方式（`DD-6.2`）：`Int`（默认）或 `Datatype`（保留开关）。
+    pub enum_encoding: EnumEncoding,
+    /// 反例区间化（`06 §6.3.7`）：默认开启；`--no-counterexample-interval` 关闭。
+    pub counterexample_interval: bool,
+    /// 区间化的**总**时间预算（毫秒，默认 500）。
+    pub interval_budget_ms: u64,
 }
 
 impl Default for VerifyOptions {
@@ -68,6 +84,12 @@ impl Default for VerifyOptions {
             minimize_budget: 64,
             quiet: false,
             goal_parallelism: 1,
+            lock_file: None,
+            no_lock: false,
+            allow_version_drift: false,
+            enum_encoding: EnumEncoding::default(),
+            counterexample_interval: true,
+            interval_budget_ms: 500,
         }
     }
 }
@@ -141,7 +163,11 @@ pub fn run(opts: &VerifyOptions) -> ExitCode {
             "PLM-GENERATED v2.1 spec={sh} gen={}",
             policylang_governance::codegen_hash(env!("CARGO_PKG_VERSION"), "codegen-1")
         );
-        let out = match generate(&checked, &header, &CodegenOptions::default()) {
+        let cg_opts = CodegenOptions {
+            enum_encoding: opts.enum_encoding,
+            ..CodegenOptions::default()
+        };
+        let out = match generate(&checked, &header, &cg_opts) {
             Ok(o) => o,
             Err(d) => {
                 compile_error = true;
@@ -166,7 +192,44 @@ pub fn run(opts: &VerifyOptions) -> ExitCode {
         }
 
         // ── ④ 探测 + 路由 ──
-        let caps = probe_all(&opts.solvers, Duration::from_millis(1200));
+        let mut caps = probe_all(&opts.solvers, Duration::from_millis(1200));
+
+        // ── ④a `policylang.lock` 校验（`06 §6.5.2`，`FR-17`）──
+        // 默认在**当前工作目录**自动发现 `policylang.lock`（规范的「启动时校验」）；
+        // `--lock <path>` 覆盖，`--no-lock` 显式禁用。
+        if !opts.no_lock {
+            let lpath: Option<PathBuf> = opts.lock_file.clone().or_else(|| {
+                let p = PathBuf::from("policylang.lock");
+                if p.is_file() {
+                    Some(p)
+                } else {
+                    None
+                }
+            });
+            if let Some(lp) = lpath {
+                match LockFile::read(&lp) {
+                    Ok(lock) => {
+                        let (drifts, ldiags) =
+                            verify_lock(&lock, &caps, opts.allow_version_drift);
+                        if ldiags.iter().any(|d| d.is_error()) {
+                            for d in &ldiags {
+                                eprintln!("{}", d.render());
+                            }
+                            return ExitCode::InternalError;
+                        }
+                        all_diags.extend(ldiags);
+                        // `required = false` 且不可用者：从候选集中剔除
+                        for n in excluded_backends(&drifts) {
+                            caps.retain(|c| c.name != n);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("policylang: {e}");
+                        return ExitCode::InternalError;
+                    }
+                }
+            }
+        }
         if let Some(cp) = &opts.emit_capability {
             if let Err(e) = std::fs::write(cp, policylang_solver::capability_json(&caps)) {
                 eprintln!("policylang: 写入能力矩阵失败：{e}");
@@ -535,12 +598,16 @@ fn solve_one(
         let domains = domains_in_play(checked, q);
         let feature = classify_feature(q, status, &verdict, &core, &conflicting, &domains);
         let summary = summary_for(q.target_type.as_str(), feature, &[], None);
-        Some(build_counterexample(
+        let mut ce = build_counterexample(
             &checked.spec,
             &domains,
             model.as_ref().unwrap_or(&empty_map()),
             summary,
-        ))
+        );
+        if opts.counterexample_interval {
+            attach_intervals(&mut ce, q, model.as_ref().unwrap_or(&empty_map()), caps, checked, opts);
+        }
+        Some(ce)
     } else {
         None
     };
@@ -868,6 +935,142 @@ fn remediate(
     Remediation {
         template_id: template,
         rendered,
+    }
+}
+
+/// 反例区间化（`06 §6.3.7`）：为**连续排序**字段求「保持违规成立」的可自由变动区间。
+///
+/// ## 机制
+/// 固定**其余全部已声明符号**为已得模型值（消去其它自由度），再对目标字段同时
+/// `(minimize)` 与 `(maximize)`；在 `:opt.priority box` 下二者于**同一轮求解**中完成
+/// ⇒ **每个字段恰好 1 次查询**（契合规范「每个 1 次查询」）。
+///
+/// ## 降级与预算
+/// * 后端须实测支持 Optimize（`Capability::f_optimize`）；否则**静默跳过**、
+///   `range` 保持 `None`（单点呈现），**不影响判定本身**（`G-4` / `G-8`）。
+/// * 最多 `8` 个字段；总耗时受 `interval_budget_ms`（默认 500 ms）约束，超预算即停。
+/// * 若某个已声明符号在模型中缺失，则**跳过该字段**——无法固定其余自由度时求出的
+///   区间不是「该反例的区间」，给出它会误导读者。
+fn attach_intervals(
+    ce: &mut Counterexample,
+    q: &EmittedQuery,
+    model: &policylang_diagnostics::Assignment,
+    caps: &[Capability],
+    checked: &CheckedSpec,
+    opts: &VerifyOptions,
+) {
+    use policylang_ast::formula::Sort;
+    use policylang_ast::naming::{global_symbol, scalar_symbol};
+
+    // 需要一个实测支持 Optimize 的可用后端
+    let Some(be) = caps.iter().find(|c| c.available && c.f_optimize) else {
+        return;
+    };
+
+    // 连续排序的候选（确定性顺序：全局变量 → 域声明序 → 实例升序 → 字段声明序）
+    let mut cands: Vec<(String, Sort)> = Vec::new();
+    for v in &checked.spec.vars {
+        if matches!(v.sort, Sort::Int | Sort::Real) {
+            cands.push((global_symbol(&v.name), v.sort.clone()));
+        }
+    }
+    for d in &checked.spec.domains {
+        let Some(ent) = checked.spec.find_entity(&d.entity) else {
+            continue;
+        };
+        for i in 0..d.size as usize {
+            for f in &ent.fields {
+                if matches!(f.sort, Sort::Int | Sort::Real) {
+                    cands.push((scalar_symbol(&d.name, i, &f.name), f.sort.clone()));
+                }
+            }
+        }
+    }
+    if cands.is_empty() {
+        return;
+    }
+
+    // 全部已声明符号（用于固定其余值）
+    let mut all: Vec<(String, Sort)> = Vec::new();
+    for v in &checked.spec.vars {
+        all.push((global_symbol(&v.name), v.sort.clone()));
+    }
+    for d in &checked.spec.domains {
+        let Some(ent) = checked.spec.find_entity(&d.entity) else {
+            continue;
+        };
+        for i in 0..d.size as usize {
+            for f in &ent.fields {
+                all.push((scalar_symbol(&d.name, i, &f.name), f.sort.clone()));
+            }
+        }
+    }
+
+    let budget = Duration::from_millis(opts.interval_budget_ms.max(50));
+    let started = Instant::now();
+    let mut found: BTreeMap<String, FieldRange> = BTreeMap::new();
+    let long_budget = Duration::from_millis(opts.interval_budget_ms.saturating_mul(2).max(500));
+
+    for (sym, _sort) in cands.iter().take(8) {
+        if started.elapsed() >= budget {
+            break;
+        }
+        // 固定其余全部符号（任一缺失 ⇒ 放弃该字段，避免给出误导性的「区间」）
+        let mut fixes: Vec<(String, String)> = Vec::with_capacity(all.len());
+        let mut complete = true;
+        for (s2, sort2) in &all {
+            if s2 == sym {
+                continue;
+            }
+            match model.get(s2) {
+                Some(v) => fixes.push((s2.clone(), policylang_diagnostics::smt_literal(v, sort2))),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+        let script = policylang_solver::build_interval_script(&q.script, &fixes, sym);
+        let argv = policylang_solver::stdin_argv(&be.name, Some(long_budget));
+        let r = policylang_solver::run_captured_argv(&be.path, &argv, Some(&script), long_budget);
+        if r.timed_out || r.spawn_error.is_some() {
+            continue;
+        }
+        if let Some((lo, hi)) = policylang_solver::interval_from_objectives(&r.stdout, sym) {
+            found.insert(sym.clone(), FieldRange { lo, hi });
+        }
+    }
+
+    if found.is_empty() {
+        return;
+    }
+
+    // 回填到反例快照（符号名由域/实例/字段确定性重建）
+    let mut notes: Vec<String> = Vec::new();
+    for snap in &mut ce.entity_snapshots {
+        for f in &mut snap.fields {
+            let sym = scalar_symbol(&snap.domain, snap.internal_index, &f.name);
+            if let Some(r) = found.get(&sym) {
+                notes.push(format!("{} ∈ [{}, {}]", f.name, r.lo, r.hi));
+                f.range = Some(r.clone());
+            }
+        }
+    }
+    for g in &mut ce.globals {
+        let sym = global_symbol(&g.name);
+        if let Some(r) = found.get(&sym) {
+            notes.push(format!("{} ∈ [{}, {}]", g.name, r.lo, r.hi));
+            g.range = Some(r.clone());
+        }
+    }
+    if !notes.is_empty() {
+        // 把区间并入摘要：读者在文本与 JSON 两处都能看到「不止一个点违规」
+        notes.sort();
+        notes.dedup();
+        ce.summary = format!("{}（可自由变动区间：{}）", ce.summary, notes.join("，"));
     }
 }
 

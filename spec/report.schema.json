@@ -83,18 +83,38 @@
         "rendered": { "type": "string", "description": "占位符替换后的确定性字符串（07 §7.2.2 / §7.4.3）。" }
       }
     },
+    "FieldRange": {
+      "title": "FieldRange",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lo", "hi"],
+      "properties": {
+        "lo": { "type": "string", "description": "下界（SMT-LIB2 字面量文本，如 80 / (- 5) / (/ 7 2)）。" },
+        "hi": { "type": "string", "description": "上界（同上）。" }
+      },
+      "description": "保持违规成立的可自由变动区间（06 §6.3.7）。"
+    },
     "FieldValue": {
       "title": "FieldValue", "type": "object", "additionalProperties": false,
       "required": ["name", "sort", "value"],
       "properties": {
         "name": { "type": "string", "minLength": 1 }, "sort": { "$ref": "#/$defs/Sort" },
-        "value": { "type": "string", "description": "已按 07 §7.2.2 格式化的确定性字符串。" }
+        "value": { "type": "string", "description": "已按 07 §7.2.2 格式化的确定性字符串。" },
+      "range": {
+        "oneOf": [{ "$ref": "#/$defs/FieldRange" }, { "type": "null" }],
+        "description": "反例区间化（06 §6.3.7）：该字段在保持违规成立前提下的可自由变动区间；未启用/不适用时为 null。"
       }
+    }
     },
     "GlobalValue": {
       "title": "GlobalValue", "type": "object", "additionalProperties": false,
       "required": ["name", "sort", "value"],
-      "properties": { "name": { "type": "string", "minLength": 1 }, "sort": { "$ref": "#/$defs/Sort" }, "value": { "type": "string" } }
+      "properties": { "name": { "type": "string", "minLength": 1 }, "sort": { "$ref": "#/$defs/Sort" }, "value": { "type": "string" },
+      "range": {
+        "oneOf": [{ "$ref": "#/$defs/FieldRange" }, { "type": "null" }],
+        "description": "反例区间化（06 §6.3.7）：该字段在保持违规成立前提下的可自由变动区间；未启用/不适用时为 null。"
+      }
+    }
     },
     "KeyRef": {
       "title": "KeyRef", "type": "object", "additionalProperties": false,

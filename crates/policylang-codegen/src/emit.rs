@@ -63,6 +63,22 @@ pub struct SymbolDecl {
     pub range: Option<RangeConstraint>,
 }
 
+/// 枚举编码方式（`DD-6.2`）。
+///
+/// 规范默认 **有界整数编码**（成员按声明序映射到 `0 … k−1`，配成员闭包断言）；
+/// `Datatype` 是**保留开关**，仅在 `ALG-3` 确认后端支持相应档位时可启用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnumEncoding {
+    /// 有界整数编码 + `(or (= x 0) … (= x k−1))` 闭包断言（默认）。
+    #[default]
+    Int,
+    /// SMT-LIB2 `declare-datatype` 代数数据类型。
+    ///
+    /// 代价：逻辑档位离开 `QF_*` 标准集（须 `ALL`），见 `DD-6.2` 的取舍说明；
+    /// 收益：类型本身即闭集，**无需**成员闭包断言，且模型值直接是构造子名。
+    Datatype,
+}
+
 /// 发射上下文。
 pub struct Emitter<'a> {
     spec: &'a Spec,
@@ -72,6 +88,8 @@ pub struct Emitter<'a> {
     pub header: String,
     /// 是否发射 `Bnd`。
     pub emit_bounds: bool,
+    /// 枚举编码方式（`DD-6.2`）。
+    pub enum_encoding: EnumEncoding,
 }
 
 impl<'a> Emitter<'a> {
@@ -82,7 +100,29 @@ impl<'a> Emitter<'a> {
             sorts: GroundSortCtx::new(tab, spec),
             header,
             emit_bounds: true,
+            enum_encoding: EnumEncoding::default(),
         }
+    }
+
+    /// 设置枚举编码方式（构造期配置，`DD-6.2`）。
+    pub fn with_enum_encoding(mut self, e: EnumEncoding) -> Self {
+        self.enum_encoding = e;
+        self
+    }
+
+    /// 需要 `declare-datatype` 的枚举类型，**按类型名排序**（确定性）。
+    fn enum_datatypes(&self) -> Vec<(String, Vec<String>)> {
+        let mut m: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for d in self.decls() {
+            if let Sort::Enum(members) = &d.sort {
+                if !members.is_empty() {
+                    m.entry(naming::enum_type_name(members))
+                        .or_insert_with(|| members.clone());
+                }
+            }
+        }
+        m.into_iter().collect()
     }
 
     pub fn sorts(&self) -> &GroundSortCtx<'a> {
@@ -133,6 +173,16 @@ impl<'a> Emitter<'a> {
         s.push_str("(set-option :produce-models true)\n");
         s.push_str("(set-option :produce-unsat-cores true)\n");
         s.push_str("(set-option :print-success false)\n");
+        // DD-6.2（datatype 编码）：枚举类型必须先于使用它的常量声明
+        if self.enum_encoding == EnumEncoding::Datatype {
+            for (tname, members) in self.enum_datatypes() {
+                let ctors: Vec<String> = members
+                    .iter()
+                    .map(|m| format!("({})", naming::enum_ctor_name(m)))
+                    .collect();
+                s.push_str(&format!("(declare-datatype {tname} ({}))\n", ctors.join(" ")));
+            }
+        }
         // CO-3：全部 declare-fun 先于首个 assert
         for d in self.decls() {
             s.push_str(&format!(
@@ -159,8 +209,11 @@ impl<'a> Emitter<'a> {
             Sort::Bool => "Bool".into(),
             Sort::Str => "String".into(),
             Sort::Bv(w) => v::bv_sort(*w),
-            // DD-6.2：Enum 采用**有界整数编码**
-            Sort::Enum(_) => "Int".into(),
+            // DD-6.2：Enum 默认**有界整数编码**；datatype 开关下用生成的类型名
+            Sort::Enum(members) => match self.enum_encoding {
+                EnumEncoding::Int => "Int".into(),
+                EnumEncoding::Datatype => naming::enum_type_name(members),
+            },
         }
     }
 
@@ -189,11 +242,24 @@ impl<'a> Emitter<'a> {
                 sym,
                 v::int_lit(*hi as i128)
             )),
+            (None, Sort::Enum(_)) if self.enum_encoding == EnumEncoding::Datatype => {
+                // datatype 是**闭类型**：任何值都必然是某个构造子 ⇒ 无需成员闭包断言
+                None
+            }
             (None, Sort::Enum(members)) => {
+                // 注意：`join("or", …)` **自带外层括号**（见文件末尾的 `join`），
+                // 因此这里**不能**再补一层——否则产出 `(assert ((or …)))`。
+                // 实测后果极严重：z3 报 `invalid function application` 并**丢弃该断言**，
+                // 但随后仍对剩余断言给出 `unsat` ⇒ 枚举变量退化为无界 `Int`，
+                // 可能产生**假证明**（与 `G-4`/`G-8` 直接冲突）。
+                if members.is_empty() {
+                    // 空枚举没有任何合法取值 ⇒ 该域为空（`E-EMPTY-CARRIER` 的语义兜底）
+                    return Some("(assert false)\n".to_string());
+                }
                 let disj: Vec<String> = (0..members.len())
                     .map(|i| format!("(= {sym} {i})"))
                     .collect();
-                Some(format!("(assert ({}))\n", join("or", &disj)))
+                Some(format!("(assert {})\n", join("or", &disj)))
             }
             _ => None,
         }
@@ -221,11 +287,17 @@ impl<'a> Emitter<'a> {
                     let _ = v0;
                     naming::global_symbol(name)
                 } else if let Some(idx) = self.sorts.enum_member_value(name) {
-                    // 枚举成员 ⇒ 有界整数编码（DD-6.2）
-                    if as_real {
-                        v::to_real(&v::int_lit(idx))
-                    } else {
-                        v::int_lit(idx)
+                    match self.enum_encoding {
+                        // 有界整数编码（DD-6.2 默认）
+                        EnumEncoding::Int => {
+                            if as_real {
+                                v::to_real(&v::int_lit(idx))
+                            } else {
+                                v::int_lit(idx)
+                            }
+                        }
+                        // datatype 构造子（零元构造子本身即为项）
+                        EnumEncoding::Datatype => naming::enum_ctor_name(name),
                     }
                 } else {
                     naming::global_symbol(name)

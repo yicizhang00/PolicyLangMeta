@@ -33,7 +33,10 @@
 *.sarif
 # 治理状态（评审记录、豁免持久化）
 .policylang/
-# 求解器基线锁定文件的**本地覆盖**（正式的 policylang.lock 应显式提交）
+# 求解器基线锁定（06 §6.5.2）
+# 本机实例不进库：其 `binary_sha256` 与本机安装的求解器二进制绑定。
+# 仓库提供可移植模板 `policylang.lock.example`，用 `policylang lock --write policylang.lock` 生成实例。
+/policylang.lock
 policylang.lock.local
 
 # ── ④ Agent 工作区与本地笔记（含机器相关路径，不适合公开）─────────────────

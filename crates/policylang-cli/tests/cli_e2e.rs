@@ -58,6 +58,15 @@ policy P { rule R: forall s in D: s.a >= 1 }
 verify consistency of P
 "##;
 
+/// `invariant` 的 SAT（⇒ Fail 且必给反例）用例，供区间化测试复用。
+const INVARIANT_SAT_SPEC: &str = r##"#lang policylang 2
+entity Service { @key id: Int [min: 1, max: 9], port: Int [min: 1, max: 65535], ip: IPv4 }
+domain Services: Set[Service] [size: 2]
+policy P { rule R: forall s in Services: s.ip == s.ip }
+invariant I { forall s in Services: in_cidr(s.ip, "10.0.0.0/8") }
+verify invariant I under P
+"##;
+
 #[test]
 fn version_and_help_exit_zero() {
     assert_eq!(run(&["version"], "sat", &[]).code, 0);
@@ -584,4 +593,209 @@ fn diff_subcommand_reports_refinement() {
     assert_eq!(o.code, 0, "stdout={} stderr={}", o.stdout, o.stderr);
     assert!(o.stdout.contains("EQUIVALENT"), "{}", o.stdout);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// `policylang.lock`（`06 §6.5.2`，`FR-17`）
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// 构造一份针对桩求解器的锁文件。`hash` 为空表示不写摘要键。
+fn lock_with(dir: &Path, version: &str, hash: Option<&str>, required: bool) -> PathBuf {
+    let mut s = String::from("lock_version = 1\n\n[[solver]]\nname = \"stub\"\n");
+    s.push_str(&format!("version = \"{version}\"\n"));
+    if let Some(h) = hash {
+        s.push_str(&format!("binary_sha256 = \"{h}\"\n"));
+    }
+    s.push_str("path = \"stub\"\n");
+    s.push_str(&format!("required = {required}\n"));
+    write(dir, "policylang.lock", &s)
+}
+
+#[test]
+fn lock_hash_mismatch_blocks_with_exit_4() {
+    let d = tmp_dir("lock-hash");
+    let f = write(&d, "a.plm", CONSISTENCY_OK);
+    let lock = lock_with(&d, "0.1", Some(&"00".repeat(32)), true);
+    let o = run(
+        &[
+            "verify",
+            f.to_str().unwrap(),
+            "--solvers",
+            &stub_arg(),
+            "--lock",
+            lock.to_str().unwrap(),
+        ],
+        "sat",
+        &[],
+    );
+    assert_eq!(o.code, 4, "摘要不符必须阻断：stdout={} stderr={}", o.stdout, o.stderr);
+    assert!(o.stderr.contains("E-SOLVER-VERSION"), "{}", o.stderr);
+}
+
+#[test]
+fn lock_drift_allowed_flag_downgrades_to_warning() {
+    let d = tmp_dir("lock-drift");
+    let f = write(&d, "a.plm", CONSISTENCY_OK);
+    let lock = lock_with(&d, "0.1", Some(&"00".repeat(32)), true);
+    // 版本故意不符 + 摘要故意不符 ⇒ 两个 `--allow-version-drift` 降级点
+    let lock2 = lock_with(&d, "9.9.9", Some(&"00".repeat(32)), true);
+    let o = run(
+        &[
+            "verify",
+            f.to_str().unwrap(),
+            "--solvers",
+            &stub_arg(),
+            "--lock",
+            lock2.to_str().unwrap(),
+            "--allow-version-drift",
+        ],
+        "sat",
+        &[],
+    );
+    assert_ne!(o.code, 4, "允许漂移时不得以 exit 4 阻断：{}", o.stderr);
+    assert!(o.stderr.contains("W-SOLVER-DRIFT"), "{}", o.stderr);
+    let _ = lock;
+}
+
+#[test]
+fn lock_optional_missing_backend_is_excluded_not_blocking() {
+    let d = tmp_dir("lock-opt");
+    let f = write(&d, "a.plm", CONSISTENCY_OK);
+    // 锁文件里的 `ghost` 后端在本机不存在，但 `required = false`
+    let s = "lock_version = 1\n\n[[solver]]\nname = \"ghost\"\nversion = \"1.0.0\"\n\
+             binary_sha256 = \"aa\"\npath = \"ghost\"\nrequired = false\n";
+    let lock = write(&d, "policylang.lock", s);
+    let o = run(
+        &[
+            "verify",
+            f.to_str().unwrap(),
+            "--solvers",
+            &stub_arg(),
+            "--lock",
+            lock.to_str().unwrap(),
+        ],
+        "sat",
+        &[],
+    );
+    assert_ne!(o.code, 4, "可选后端缺失不应阻断：{}", o.stderr);
+    assert!(o.stderr.contains("W-SOLVER-MISSING"), "{}", o.stderr);
+}
+
+#[test]
+fn lock_required_missing_backend_is_blocking() {
+    let d = tmp_dir("lock-req");
+    let f = write(&d, "a.plm", CONSISTENCY_OK);
+    let s = "lock_version = 1\n\n[[solver]]\nname = \"ghost\"\nversion = \"1.0.0\"\n\
+             binary_sha256 = \"aa\"\npath = \"ghost\"\nrequired = true\n";
+    let lock = write(&d, "policylang.lock", s);
+    let o = run(
+        &[
+            "verify",
+            f.to_str().unwrap(),
+            "--solvers",
+            &stub_arg(),
+            "--lock",
+            lock.to_str().unwrap(),
+        ],
+        "sat",
+        &[],
+    );
+    assert_eq!(o.code, 4, "必需后端缺失必须阻断：{}", o.stderr);
+    assert!(o.stderr.contains("E-SOLVER-MISSING"), "{}", o.stderr);
+}
+
+#[test]
+fn lock_subcommand_writes_parseable_portable_lock() {
+    let d = tmp_dir("lock-gen");
+    let out = d.join("policylang.lock");
+    let o = run(
+        &["lock", "--write", out.to_str().unwrap(), "--required", "stub", &stub_arg()],
+        "sat",
+        &[],
+    );
+    assert_eq!(o.code, 0, "stderr={}", o.stderr);
+    let body = std::fs::read_to_string(&out).expect("锁文件应被写入");
+    assert!(body.contains("lock_version = 1"), "{body}");
+    assert!(body.contains("name = \"stub\""), "{body}");
+    assert!(body.contains("required = true"), "{body}");
+    // 摘要必须是 64 位十六进制（真实 SHA-256）
+    let sha_line = body
+        .lines()
+        .find(|l| l.starts_with("binary_sha256"))
+        .expect("应含摘要");
+    let hexpart = sha_line.trim_start_matches("binary_sha256 = ").trim_matches('"');
+    assert_eq!(hexpart.len(), 64, "{sha_line}");
+    assert!(hexpart.chars().all(|c| c.is_ascii_hexdigit()), "{sha_line}");
+    // 不得把本机绝对路径写入（`path` 已规范化为 `~/` 或裸名）
+    assert!(!body.contains(r"C:/Users"), "锁文件泄露了本机路径：{body}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 反例区间化（`06 §6.3.7`）
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn counterexample_interval_degrades_gracefully_without_optimize_backend() {
+    // 桩求解器不支持 Optimize（无 `f_optimize`）⇒ 区间化必须**静默跳过**，
+    // 反例保持单点呈现，且**绝不影响判定**（G-4 / G-8）。
+    let d = tmp_dir("interval-degrade");
+    let f = write(&d, "inv.plm", INVARIANT_SAT_SPEC);
+    let rep_key = "r-interval.json";
+    let rep = d.join(rep_key);
+    let o = run(
+        &[
+            "verify",
+            f.to_str().unwrap(),
+            "--solvers",
+            &stub_arg(),
+            "--output",
+            rep.to_str().unwrap(),
+        ],
+        "sat",
+        &[],
+    );
+    assert!(
+        (0..=2).contains(&o.code),
+        "不得因区间化而改变判定：code={} stderr={}",
+        o.code,
+        o.stderr
+    );
+    assert!(!o.stderr.contains("panicked"), "{}", o.stderr);
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rep).unwrap()).unwrap();
+    // 反例存在（invariant 的 sat ⇒ Fail），但 range 必须缺省（不伪造区间）
+    for c in r["checks"].as_array().unwrap() {
+        if let Some(ce) = c.get("counterexample").filter(|v| !v.is_null()) {
+            for s in ce["entity_snapshots"].as_array().unwrap() {
+                for fv in s["fields"].as_array().unwrap() {
+                    assert!(
+                        fv.get("range").is_none(),
+                        "无 Optimize 后端时不得产出区间：{fv}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn counterexample_interval_can_be_disabled() {
+    let d = tmp_dir("interval-off");
+    let f = write(&d, "inv.plm", INVARIANT_SAT_SPEC);
+    let rep = d.join("r-off.json");
+    let o = run(
+        &[
+            "verify",
+            f.to_str().unwrap(),
+            "--solvers",
+            &stub_arg(),
+            "--no-counterexample-interval",
+            "--output",
+            rep.to_str().unwrap(),
+        ],
+        "sat",
+        &[],
+    );
+    assert!(!o.stderr.contains("panicked"), "{}", o.stderr);
+    assert!(std::fs::read_to_string(&rep).is_ok(), "报告应仍被写出");
 }

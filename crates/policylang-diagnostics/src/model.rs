@@ -53,6 +53,25 @@ fn collect(e: &SExpr, out: &mut Assignment) {
             out.insert(name, value_of(val, sort));
         }
         _ => {
+            // ── 容错：**裸定义列表**形式的模型 ────────────────────────────────────
+            // 实测 z3 5.3.0 与 cvc5 1.4.2 的 `(get-model)` 输出**不含 `model` 关键字**，
+            // 而是直接给出定义列表：`((define-fun x () Int 7) …)`。
+            // SMT-LIB2 的标准形式是 `(model (define-fun …))`，因此**两种都必须接受**
+            // （否则反例还原静默失效：模型解析为空 ⇒ 报告缺失业务可读反例）。
+            //
+            // 判定条件刻意**收紧**：只有当列表中**确实存在** `define-fun`/`model` 头的子列表时
+            // 才按容器递归，避免对 `(A B)`（Unsat Core）或 `(error "…")` 产生误提取。
+            let container = list.iter().any(|x| {
+                x.as_list()
+                    .and_then(|l| l.first())
+                    .and_then(SExpr::as_atom)
+                    .map_or(false, |h| matches!(h, "define-fun" | "define-fun-rec" | "model"))
+            });
+            if container {
+                for x in list {
+                    collect(x, out);
+                }
+            }
             // 其它列表（如 `(error …)`）忽略
         }
     }
@@ -102,11 +121,57 @@ pub fn value_of(e: &SExpr, _sort: Option<&SExpr>) -> Value {
     }
 }
 
+/// 把模型值渲染为**合法的 SMT-LIB2 字面量**（供反例区间化的固定断言，`06 §6.3.7`）。
+///
+/// 与 [`crate::format_value`]（面向人类阅读）相对：本函数面向**机器**，
+/// 必须产出可直接嵌入 `(assert (= sym <字面量>))` 的文本。
+pub fn smt_literal(v: &Value, sort: &policylang_ast::formula::Sort) -> String {
+    use policylang_ast::formula::Sort;
+    match (v, sort) {
+        // 枚举（整数编码）：下标；枚举（datatype）：零元构造子
+        (Value::Int(i), Sort::Enum(_)) => i.to_string(),
+        (Value::Str(s), Sort::Enum(_)) => policylang_ast::naming::enum_ctor_name(s),
+        (Value::Int(i), _) => {
+            if *i < 0 {
+                format!("(- {})", -(*i as i128))
+            } else {
+                i.to_string()
+            }
+        }
+        (Value::Real(r), _) => {
+            let mag = if r.den == 1 {
+                format!("{}.0", r.num.abs())
+            } else {
+                format!("(/ {} {})", r.num.abs(), r.den)
+            };
+            if r.num < 0 {
+                format!("(- {mag})")
+            } else {
+                mag
+            }
+        }
+        (Value::Bool(b), _) => b.to_string(),
+        // SMT-LIB 2.6：字串内的 `"` 写作 `""`
+        (Value::Str(s), _) => format!("\"{}\"", s.replace('"', "\"\"")),
+        (Value::Bv(x, w), _) => {
+            let w = if *w == 0 { 32 } else { *w };
+            format!("(_ bv{x} {w})")
+        }
+        // 未识别的值：原样透传（可能是求解器私有形式），交由求解器判定
+        (Value::Unknown(s), _) => s.clone(),
+    }
+}
+
 fn parse_atom(a: &str) -> Value {
     match a {
         "true" => return Value::Bool(true),
         "false" => return Value::Bool(false),
         _ => {}
+    }
+    // datatype 编码的枚举（`DD-6.2` 的保留开关）：`PL_M_<escaped member>` ⇒ 成员名。
+    // 无需排序表即可还原（构造子名自带成员信息，`naming::enum_ctor_name`）。
+    if let Some(rest) = a.strip_prefix("PL_M_") {
+        return Value::Str(policylang_ast::naming::unescape(rest));
     }
     if let Some(hex) = a.strip_prefix("#x") {
         let val = u128::from_str_radix(hex, 16).unwrap_or(0);

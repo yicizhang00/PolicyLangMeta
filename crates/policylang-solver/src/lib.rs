@@ -9,31 +9,42 @@
 //! 差别仅在于不引入异步运行时（本环境无法离线获取其 `rt-multi-thread` 依赖）。
 
 pub mod crossval;
+pub mod discover;
+pub mod interval;
+pub mod invocation;
+pub mod lockfile;
 pub mod orchestra;
 pub mod probe;
 pub mod response;
 pub mod router;
 
 pub use crossval::{eval_formula, reglan_full_match, replay, Replay};
+pub use discover::{base_name, default_roots, ENV_SEARCH_PATH};
+pub use interval::{build_interval_script, interval_from_objectives};
+pub use invocation::{proof_hint, stdin_argv};
+pub use lockfile::{
+    excluded_backends, is_blocking, normalize_version, sha256_file, verify_lock, Drift, DriftKind,
+    LockEntry, LockFile, LOCK_VERSION,
+};
 pub use orchestra::{
-    extract_named_label, kill_and_reap, rebuild_script, run_captured, solve_race,
+    extract_named_label, kill_and_reap, rebuild_script, run_captured, run_captured_argv, solve_race,
     split_named_asserts, Backend, Confirmation, ProcResult, RaceOptions, RaceOutcome, SolverRun,
 };
 pub use probe::{capability_json, probe_all, probe_backend, Capability, CANDIDATE_LOGICS};
-pub use response::{parse_responses, ParsedOutput, Response, Verdict};
+pub use response::{
+    is_expected_mismatch, parse_responses, ParsedOutput, Response, Verdict,
+};
 pub use router::{route, Route, RouteOptions, BASELINE_MATRIX};
 
 use std::time::Duration;
 
 /// 按默认名称发现后端（`z3` / `cvc5` / `bitwuzla`）。
+///
+/// 解析每个后端的**绝对可执行路径**（`PATH` → `POLICYLANG_SOLVER_PATH` → 用户级默认安装根，
+/// 见 [`discover`] 模块）；未找到时回退为裸可执行名，使「缺失」以启动失败的形式
+/// 暴露给 `ALG-3` 探测。
 pub fn discover_backends() -> Vec<Backend> {
-    probe::DEFAULT_BACKENDS
-        .iter()
-        .map(|(name, exe)| Backend {
-            name: (*name).to_string(),
-            path: (*exe).to_string(),
-        })
-        .collect()
+    discover::discover()
 }
 
 /// 便捷：探测 + 路由。

@@ -102,6 +102,16 @@ impl ParsedOutput {
             .collect()
     }
 
+    /// **未预期**的错误（`06 §6.8.3`）：排除「同发 `get-model` / `get-unsat-core`」必然产生的错配。
+    ///
+    /// 只有本方法返回非空时才是真正的协议故障（`E-SOLVER-PROTOCOL`，exit 4）。
+    pub fn unexpected_errors(&self) -> Vec<&str> {
+        self.errors()
+            .into_iter()
+            .filter(|e| !is_expected_mismatch(e))
+            .collect()
+    }
+
     /// 求解器是否报「不支持的逻辑」（用于 `ALG-3` 与档位回落判定）。
     pub fn is_unsupported_logic(&self) -> bool {
         self.errors().iter().any(|e| {
@@ -109,6 +119,37 @@ impl ParsedOutput {
             l.contains("unsupported logic") || l.contains("unknown logic") || l.contains("logic")
         })
     }
+}
+
+/// 该错误消息是否为**预期错配**（`06 §6.8.3`）。
+///
+/// ## 为什么必然存在预期错配
+/// 生成器对所有目标**同发** `(get-model)` 与 `(get-unsat-core)`（`06 §6.1.1` 的设计决策）：
+/// SMT-LIB 脚本是**静态文本**，在求解之前无法知道结果是 `sat` 还是 `unsat`，而两种结果
+/// 各自需要不同的 payload。于是每次查询中必然有一个命令拿到与之不匹配的结果，
+/// 其 `(error …)` 属**协议预期**而非故障——必须忽略，否则会把**有效判定**误降级为
+/// `E-SOLVER-PROTOCOL`（实测：真实 z3/cvc5 下 `unsat` 判定被整条丢弃）。
+///
+/// 覆盖面按**实测消息**制定（z3 5.3.0 / cvc5 1.4.2，本机 2026-10-15）：
+///
+/// | 情形 | z3 | cvc5 |
+/// |---|---|---|
+/// | `unsat` 后 `(get-model)` | `model is not available` | `cannot get model unless after a SAT or UNKNOWN response.` |
+/// | `sat` 后 `(get-unsat-core)` | `unsat core is not available` | `cannot get unsat core unless in unsat mode.` |
+pub fn is_expected_mismatch(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "model is not available",
+        "unsat core is not available",
+        "no unsat core available",
+        "cannot get model",
+        "cannot get unsat core",
+        "unless after a sat",
+        "unless in unsat mode",
+        "produce-models",
+        "produce-unsat-cores",
+    ];
+    PATTERNS.iter().any(|p| m.contains(p))
 }
 
 /// 解析求解器 stdout。
@@ -340,5 +381,33 @@ mod tests {
     fn unsupported_logic_is_detected() {
         let p = parse_responses("(error \"unsupported logic QF_BVLIA\")\n");
         assert!(p.is_unsupported_logic());
+    }
+
+    #[test]
+    fn expected_mismatches_are_not_protocol_errors() {
+        // 实测消息（本机 z3 5.3.0 / cvc5 1.4.2）
+        for m in [
+            "model is not available",
+            "line 8 column 15: unsat core is not available",
+            "cannot get model unless after a SAT or UNKNOWN response.",
+            "cannot get unsat core unless in unsat mode.",
+        ] {
+            assert!(is_expected_mismatch(m), "应判为预期错配：{m}");
+        }
+        // 真故障不得被豁免
+        assert!(!is_expected_mismatch(
+            "invalid function application, arguments missing"
+        ));
+        assert!(!is_expected_mismatch("unsupported logic QF_BVLIA"));
+
+        // 关键回归：`unsat` + 预期错配**不得**被升级为协议故障，
+        // 否则真实求解器下的有效判定会被整条丢弃（曾经的真实缺陷）。
+        let p = parse_responses("unsat\n(error \"model is not available\")\n(A B)\n");
+        assert_eq!(p.verdict(), Some(Verdict::Unsat));
+        assert!(p.unexpected_errors().is_empty());
+        assert_eq!(p.errors().len(), 1, "预期错配仍应被记录以供审计");
+
+        let p2 = parse_responses("sat\n(error \"invalid function application\")\n");
+        assert_eq!(p2.unexpected_errors().len(), 1, "真故障必须被识别");
     }
 }

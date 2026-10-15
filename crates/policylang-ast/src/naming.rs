@@ -113,8 +113,103 @@ pub fn label_old_neg(policy: &str) -> String {
     clamp_label(format!("PLR__{}__OLD_NEG", escape(policy)))
 }
 
+/// 枚举（datatype 编码，`DD-6.2`）的**类型名**，由成员列表确定性派生。
+///
+/// `Sort::Enum` 只携带成员名（DSL 的枚举是匿名的），故类型名必须由成员列表导出；
+/// 且**同一成员列表必须得到同一名字**，否则 `query_hash` 不可复算（`TH-10`）。
+/// 采用「各成员 `escape` 后以 `_` 连接」：既确定又可读，且因 `escape` 单射而**无碰撞**
+/// （`escape` 把所有 `_` 转义为 `_u005F`，故 `["A_B"]` 与 `["A","B"]` 结果不同）。
+pub fn enum_type_name(members: &[String]) -> String {
+    let mut s = String::from("PL_T");
+    if members.is_empty() {
+        return s + "_EMPTY";
+    }
+    for m in members {
+        s.push('_');
+        s.push_str(&escape(m));
+    }
+    s
+}
+
+/// 枚举成员的**零元构造子**名（datatype 编码）。
+///
+/// 加 `PL_M_` 前缀的两个理由：① 避免与变量 / 域符号撞名；
+/// ② 使**模型还原只需剥前缀**——无需携带排序→成员表即可把
+/// `PL_M_Enhanced` 还原为 `Enhanced`（`07 §7.2`）。
+pub fn enum_ctor_name(member: &str) -> String {
+    format!("PL_M_{}", escape(member))
+}
+
+/// [`escape`] 的**严格逆运算**。
+///
+/// 因 `escape` 把所有 `_` 转义为 `_u005F`，转义结果中的任何 `_` 都必然是转义序列的开头，
+/// 故解码无歧义（`unescape(escape(x)) == x`）。
+pub fn unescape(s: &str) -> String {
+    let ch: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    while i < ch.len() {
+        if ch[i] == '_' {
+            // `_uXXXX`（4 位）或 `_UXXXXXX`（6 位）
+            let n = match ch.get(i + 1) {
+                Some('u') => 4usize,
+                Some('U') => 6usize,
+                _ => 0usize,
+            };
+            {
+                if n > 0 && i + 2 + n <= ch.len() {
+                    let hex: String = ch[i + 2..i + 2 + n].iter().collect();
+                    if let Ok(v) = u32::from_str_radix(&hex, 16) {
+                        if let Some(c) = char::from_u32(v) {
+                            out.push(c);
+                            i += 2 + n;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(ch[i]);
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn enum_type_name_is_deterministic_and_injective() {
+        let a = enum_type_name(&["A".into(), "B".into()]);
+        let b = enum_type_name(&["A".into(), "B".into()]);
+        assert_eq!(a, b);
+        // 单射性：`["A_B"]` 与 `["A","B"]` 必须不同（否则两个不同枚举共用同一类型名）
+        let c = enum_type_name(&["A_B".into()]);
+        assert_ne!(a, c, "枚举类型名必须无碰撞");
+        assert!(a.starts_with("PL_T_"));
+        assert_eq!(enum_type_name(&[]), "PL_T_EMPTY");
+    }
+
+    #[test]
+    fn unescape_is_the_inverse_of_escape() {
+        for x in [
+            "Institutional", "my_member", "a_u0041b", "10.0.0.0/8", "值域", "", "x-y",
+        ] {
+            assert_eq!(unescape(&escape(x)), x, "往返失败：{x}");
+        }
+        // 转义结果里不得出现裸 `_`
+        let e = escape("a_b");
+        assert!(e.contains("_u005F"), "{e}");
+    }
+
+    #[test]
+    fn enum_ctor_name_round_trips_through_model_decoding() {
+        for m in ["Basic", "my_kind", "a_u0041b"] {
+            let ctor = enum_ctor_name(m);
+            assert!(ctor.starts_with("PL_M_"));
+            assert_eq!(unescape(ctor.trim_start_matches("PL_M_")), m);
+        }
+    }
     use super::*;
     use std::collections::HashMap;
 

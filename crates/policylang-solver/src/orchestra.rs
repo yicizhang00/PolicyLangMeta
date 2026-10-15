@@ -47,6 +47,20 @@ pub fn run_captured(
     stdin_data: Option<&str>,
     timeout: Duration,
 ) -> ProcResult {
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    run_captured_argv(program, &owned, stdin_data, timeout)
+}
+
+/// 同 [`run_captured`]，但接受**拥有所有权**的 argv。
+///
+/// 供需要按后端合成命令行的调用方使用（如 `z3` 的 `-T:<秒>` 软超时），
+/// 命令行构造规则见 [`crate::invocation`]。
+pub fn run_captured_argv(
+    program: &str,
+    args: &[String],
+    stdin_data: Option<&str>,
+    timeout: Duration,
+) -> ProcResult {
     let started = Instant::now();
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -442,15 +456,22 @@ pub fn solve_race(script: &str, backends: &[Backend], opts: &RaceOptions) -> Rac
             ));
         }
     }
-    if runs.iter().any(|r| {
-        r.raw
-            .errors()
-            .iter()
-            .any(|e| e.contains("unexpected") || e.contains("invalid"))
-    }) {
+    // `06 §6.8.3`：只有**未预期**的错误才升级为 `E-SOLVER_PROTOCOL`。
+    // 「同发 `get-model` / `get-unsat-core`」必然产生的错配属协议预期、必须忽略——
+    // 早期实现用 `contains("invalid")` 之类的启发式，会把真实求解器的有效判定整条丢弃。
+    let mut unexpected: Vec<String> = Vec::new();
+    for r in &runs {
+        for e in r.raw.unexpected_errors() {
+            unexpected.push(format!("{}: {}", r.name, e));
+        }
+    }
+    if !unexpected.is_empty() {
         diagnostics.push(Diagnostic::error(
             E_SOLVER_PROTOCOL,
-            "求解器响应含未预期的 `(error …)`：请检查脚本是否与后端能力匹配",
+            format!(
+                "求解器响应含未预期的 `(error …)`：{}（请检查脚本是否与后端能力匹配）",
+                unexpected.join("; ")
+            ),
         ));
     }
 
@@ -472,7 +493,12 @@ fn run_one(
 ) -> SolverRun {
     let started = Instant::now();
     let mut cmd = Command::new(&b.path);
-    cmd.arg("-in").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // 按后端合成命令行：三款后端的 stdin 约定互不相同（`06 §6.5.1`）。
+    // 历史上此处硬编码 `-in`，导致 cvc5 / bitwuzla 全部探测失败（见 `invocation` 模块）。
+    cmd.args(crate::invocation::stdin_argv(&b.name, Some(timeout)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

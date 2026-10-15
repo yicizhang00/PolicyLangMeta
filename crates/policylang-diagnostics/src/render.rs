@@ -74,6 +74,10 @@ pub struct FieldValue {
     pub name: String,
     pub sort: String,
     pub value: String,
+    /// 反例区间化（`06 §6.3.7`）：该字段在**保持违规成立**前提下的可自由变动区间。
+    /// `None` = 未启用、不适用（非连续排序）、或后端不支持 Optimize（`f_optimize = false`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<FieldRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +85,25 @@ pub struct GlobalValue {
     pub name: String,
     pub sort: String,
     pub value: String,
+    /// 见 [`FieldValue::range`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<FieldRange>,
+}
+
+/// 「保持违规成立」的自由变动区间（`06 §6.3.7`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FieldRange {
+    /// 下界（SMT-LIB2 字面量文本，如 `80` / `(- 5)` / `(/ 7 2)`）。
+    pub lo: String,
+    /// 上界（同上）。
+    pub hi: String,
+}
+
+impl FieldRange {
+    /// 单点区间（`lo == hi`）也应呈现为区间，以便读者明确「此处确实无自由度」。
+    pub fn is_point(&self) -> bool {
+        self.lo == self.hi
+    }
 }
 
 /// 一个域实例的快照。
@@ -221,6 +244,7 @@ pub fn build_counterexample(
                     name: f.name.clone(),
                     sort: f.sort.display_name().to_string(),
                     value: val,
+                    range: None,
                 });
             }
             let primary_key = key_field.as_ref().and_then(|k| {
@@ -249,6 +273,7 @@ pub fn build_counterexample(
         .map(|v| GlobalValue {
             name: v.name.clone(),
             sort: v.sort.display_name().to_string(),
+            range: None,
             value: assignment
                 .get(&global_symbol(&v.name))
                 .map(|x| format_value(x, &v.sort))
