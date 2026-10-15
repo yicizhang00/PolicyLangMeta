@@ -1,0 +1,16 @@
+[package]
+name = "policylang-governance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CR-7 审计报告 / 四哈希分层 / SARIF / Waiver / CI 门禁与退出码"
+
+[dependencies]
+policylang-ast.workspace = true
+policylang-diagnostics.workspace = true
+policylang-codegen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "policylang-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CR-4 Grounder（ALG-1/ALG-2）与 SMT-LIB2 生成器"
+
+[dependencies]
+policylang-ast.workspace = true
+policylang-check.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+policylang-parser.workspace = true

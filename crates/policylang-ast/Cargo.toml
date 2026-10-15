@@ -1,0 +1,13 @@
+[package]
+name = "policylang-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CR-2 强类型 AST、排序系统与展平命名（叶子 crate）"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true

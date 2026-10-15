@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/policylang-ast",
+    "crates/policylang-parser",
+    "crates/policylang-check",
+    "crates/policylang-codegen",
+    "crates/policylang-solver",
+    "crates/policylang-diagnostics",
+    "crates/policylang-governance",
+    "crates/policylang-cli",
+]
+
+[workspace.package]
+version = "2.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "PolicyLang Meta — 领域无关的策略语言定义、可判定性编译与形式化验证元框架"
+
+[workspace.dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.10.9"
+hex = "0.4.3"
+thiserror = "1.0.69"
+pest = "2.9.3"
+pest_derive = "2.9.3"
+
+policylang-ast = { path = "crates/policylang-ast" }
+policylang-parser = { path = "crates/policylang-parser" }
+policylang-check = { path = "crates/policylang-check" }
+policylang-codegen = { path = "crates/policylang-codegen" }
+policylang-solver = { path = "crates/policylang-solver" }
+policylang-diagnostics = { path = "crates/policylang-diagnostics" }
+policylang-governance = { path = "crates/policylang-governance" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

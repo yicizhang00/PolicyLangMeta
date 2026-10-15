@@ -1,0 +1,48 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# PolicyLang Meta — .gitattributes
+#
+# 目的：跨平台（Windows / Linux / macOS）协作时，保证
+#   ① 仓库内换行符恒为 LF（消除 CRLF 引起的整文件 diff 噪声）；
+#   ② 文本文件启用 diff，二进制文件不被误处理；
+#   ③ shell 脚本在 Windows 检出时也保持 LF（否则 bash 无法执行）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 默认：由 Git 自动判定文本文件，并在仓库内规范化为 LF
+* text=auto eol=lf
+
+# ── 显式声明为文本（影响 diff 与合并策略）──────────────────────────────────
+*.rs        text diff=rust
+*.toml      text
+*.lock      text
+*.md        text diff=markdown
+*.pest      text
+*.plm       text
+*.smt2      text
+*.lean      text
+*.json      text
+*.yaml      text
+*.yml       text
+*.sh        text eol=lf
+.gitignore  text
+.gitattributes text
+
+# Lean 工具链版本文件必须逐字节比较
+lean-toolchain text eol=lf
+
+# ── 二进制（不做换行符转换，不做文本 diff）─────────────────────────────────
+*.exe       binary
+*.dll       binary
+*.pdb       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.pdf       binary
+*.zip       binary
+
+# ── 语言统计：文档与规格不计入代码行数 ─────────────────────────────────────
+docs/**       linguist-documentation
+examples/**   linguist-documentation
+lean/**       linguist-language=Lean
+*.pest        linguist-language=Pest
+*.plm         linguist-language=PolicyLang

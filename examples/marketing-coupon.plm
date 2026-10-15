@@ -1,0 +1,84 @@
+// =============================================================================
+// examples/marketing-coupon.plm — 电商阶梯发券完备性验证案例
+// -----------------------------------------------------------------------------
+// 用途      : 覆盖 G-3 的“完备性（completeness）”与“互斥（mutex）”演算实例，
+//             演示 branch 分支划分、分支互斥声明与死区反例。
+// 覆盖 FR   : FR-1（实体/枚举）、FR-2（策略与分支）、FR-3（completeness / mutex）、
+//             FR-6（无死区证明）、FR-7（死区反例还原）。
+// 覆盖 AC   : AC-6 家族（完备性目标）与互斥目标；故意留死区的变体演示 FAIL。
+// 预期判定  : completeness => PASS（三支覆盖 order_amount ∈ [0,100000]，退出码 0）
+//             mutex        => PASS（三组互斥均成立，退出码 0）
+//             consistency  => PASS（退出码 0）
+//             文件内被注释的“留死区”变体 => completeness FAIL（退出码 1）
+// 编译逻辑档: QF_LIA（Int 线性算术 + Enum 编码），03 §3.10.2 可判定。
+// 说明      : 本文件必须可被 spec/grammar.pest 完整解析。
+// =============================================================================
+
+#lang policylang 2
+
+// —— 1. 领域实体：会员 ——
+entity Customer {
+    id: Int [min: 1, max: 100000],
+    tier: Enum { Bronze, Silver, Gold },
+    lifetime_orders: Int [min: 0, max: 1000]
+}
+
+// —— 2. 有界实体集合域：size = 6 ——
+domain Customers: Set[Customer] [size: 6]
+
+// —— 3. 全局变量：发券决策输入域 ——
+var order_amount: Int [min: 0, max: 100000]     // 本单金额（单位：分）
+var loyalty_tier: Enum { Bronze, Silver, Gold } // 会员等级
+var campaign_active: Bool                       // 活动开关
+var coupon_quota: Int [min: 0, max: 100]        // 本单发券数
+
+// —— 4. 策略集：分支划分 + 互斥声明 + 约束规则 ——
+policy CouponDispatchPolicy {
+    // 阶梯分支（completeness 目标所覆盖的输入域划分，三支并为全集）
+    branch HighValue: order_amount >= 500
+    branch MidValue: order_amount >= 100 and order_amount < 500
+    branch LowValue: order_amount < 100
+    // => 三支并集 = order_amount ∈ [0, 100000] = 全域 ⇒ completeness 期望 PASS
+
+    // 互斥声明：任一两支不得同时命中（verify mutex 逐一反证）
+    mutex HighValue, MidValue
+    mutex HighValue, LowValue
+    mutex MidValue, LowValue
+    // => 语义：∀m. ¬(B_A(m) ∧ B_B(m))（见 04 §7.5）
+
+    // 规则 1：高价值 + 金卡客户，券额度至少 10
+    rule HighTierBoost:
+        (order_amount >= 500 and loyalty_tier == Gold) implies coupon_quota >= 10
+
+    // 规则 2：活动未开启时券额度必须为 0（布尔原子参与蕴含）
+    rule CampaignGate:
+        not campaign_active implies coupon_quota == 0
+    // => `not campaign_active` 经 f_not → bool_atom 上升为公式（03 §3.4.2）
+}
+
+// —— 5. 验证目标 ——
+verify completeness of CouponDispatchPolicy     // => PASS（全域无死区）, exit 0
+verify mutex of CouponDispatchPolicy            // => PASS（三组互斥）, exit 0
+verify consistency of CouponDispatchPolicy      // => PASS（存在合法发券配置）, exit 0
+
+// =============================================================================
+// 变体（故意留死区）—— 将 MidValue 下界抬高到 200，使 [100, 200) 无分支覆盖
+//   policy CouponDispatchPolicy {
+//       branch HighValue: order_amount >= 500
+//       branch MidValue: order_amount >= 200 and order_amount < 500
+//       branch LowValue: order_amount < 100
+//       ...
+//   }
+//   verify completeness of CouponDispatchPolicy
+//   // => FAIL, exit 1：反证查询断言 (and (not HighValue) (not MidValue) (not LowValue))
+//   //    返回 SAT，模型给出死区反例 order_amount ∈ [100, 199]；
+//   //    诊断形态：{"check":"completeness","gap":[{"var":"order_amount","lo":100,"hi":199}]}。
+// =============================================================================
+
+// =============================================================================
+// 变体（互斥破坏）—— 把 MidValue 改为下界 100 但仍与 LowValue 重叠时
+//   branch MidValue: order_amount >= 100 and order_amount < 500
+//   branch LowValue: order_amount < 200          // 与 MidValue 在 [100,200) 重叠
+//   verify mutex of CouponDispatchPolicy
+//   // => FAIL, exit 1：反例 order_amount = 150 同时命中 MidValue 与 LowValue。
+// =============================================================================

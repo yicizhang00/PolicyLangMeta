@@ -1,0 +1,16 @@
+[package]
+name = "policylang-solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CR-5 理论感知路由 / 进程级竞速编排 / 响应流解析 / 交叉验证 / 能力探测"
+
+[dependencies]
+policylang-ast.workspace = true
+policylang-check.workspace = true
+policylang-diagnostics.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true

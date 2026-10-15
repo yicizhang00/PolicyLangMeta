@@ -1,0 +1,15 @@
+[package]
+name = "policylang-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CR-3 符号表 / 类型检查 / 可判定性守卫 / Logic 探针 / 预算"
+
+[dependencies]
+policylang-ast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+policylang-parser.workspace = true

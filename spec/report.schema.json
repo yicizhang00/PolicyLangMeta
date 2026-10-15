@@ -1,0 +1,276 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:policylang:report:1.0",
+  "title": "PolicyLang Meta 审计报告（VerificationReport）",
+  "schema_version": "1.0",
+  "description": "PolicyLang Meta 审计报告的机器可读契约，与 docs/07-诊断审计与治理规范.md §7.5 严格一致。版本策略（00 §0.6）：1.x 内『只增字段』；生产端以 additionalProperties:false 校验自身，消费方 MUST 容忍未知字段（不得因本 schema 的 additionalProperties:false 而拒绝含未知字段的报告），以保证前向兼容。序列化 MUST 遵循 RFC 8785（JCS）：对象成员按键名 UTF-16 码元序、无多余空白、数字最短往返、UTF-8 无 BOM（07 §7.2.3）。所有数组均为『有序数组』，元素顺序具有语义（保序），严禁改用 JSON object 表达集合。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "report_id", "timestamp", "overall_status", "exit_code", "logic_used", "spec_hash", "query_hash", "proof_hash", "attestation_hash", "tool", "attestation", "checks", "waivers", "summary"],
+  "properties": {
+    "schema_version": { "const": "1.0", "description": "报告结构版本。" },
+    "report_id": { "type": "string", "minLength": 1, "description": "报告实例标识，建议 rpt-<UTC 时间戳>-<短随机>。不参与 proof_hash。" },
+    "timestamp": { "type": "string", "format": "date-time", "description": "生成时刻（UTC，RFC 3339）。不参与 proof_hash。" },
+    "overall_status": { "$ref": "#/$defs/GateStatus", "description": "合并格 join：Error ⊐ Fail ⊐ UnknownReviewRequired ⊐ Waived ⊐ Pass（00 §0.4.2）。" },
+    "exit_code": { "type": "integer", "minimum": 0, "maximum": 4, "description": "CLI 退出码（00 §0.4.3）；须与 overall_status 一致，见 allOf。" },
+    "logic_used": { "type": "string", "minLength": 1, "description": "实际使用的 SMT 逻辑档位（QF_LIA/QF_BV/QF_SLIA/…）。" },
+    "spec_hash": { "$ref": "#/$defs/Hash", "description": "规范哈希：hex(SHA256(canon_src(.plm)))，07 §7.5.3。" },
+    "query_hash": { "$ref": "#/$defs/Hash", "description": "查询哈希：hex(SHA256(canon_smt(SMT-LIB2 文本)))，07 §7.5.3。" },
+    "proof_hash": { "$ref": "#/$defs/Hash", "description": "溯源自证哈希：hex(SHA256(SHA256(spec)‖SHA256(query)‖canonical_verdict))；仅覆盖数学事实（TH-10，07 §7.5.6）。" },
+    "attestation_hash": { "$ref": "#/$defs/Hash", "description": "运行证明哈希：hex(SHA256(proof_hash‖JCS(attestation_record)))（07 §7.5.3(4)）。" },
+    "tool": { "$ref": "#/$defs/Tool" },
+    "attestation": { "$ref": "#/$defs/Attestation" },
+    "checks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/Check" }, "description": "每个验证目标一项，有序数组（保序）。" },
+    "waivers": { "type": "array", "items": { "$ref": "#/$defs/Waiver" }, "description": "生效/过期豁免，有序数组（按声明顺序）。" },
+    "summary": { "$ref": "#/$defs/Summary" }
+  },
+  "allOf": [
+    { "if": { "properties": { "overall_status": { "const": "Pass" } }, "required": ["overall_status"] }, "then": { "properties": { "exit_code": { "const": 0 } } } },
+    { "if": { "properties": { "overall_status": { "const": "Waived" } }, "required": ["overall_status"] }, "then": { "properties": { "exit_code": { "const": 0 } } } },
+    { "if": { "properties": { "overall_status": { "const": "Fail" } }, "required": ["overall_status"] }, "then": { "properties": { "exit_code": { "const": 1 } } } },
+    { "if": { "properties": { "overall_status": { "const": "UnknownReviewRequired" } }, "required": ["overall_status"] }, "then": { "properties": { "exit_code": { "const": 2 } } } },
+    { "if": { "properties": { "overall_status": { "const": "Error" } }, "required": ["overall_status"] }, "then": { "properties": { "exit_code": { "enum": [3, 4] } } } }
+  ],
+  "$defs": {
+    "GateStatus": { "title": "GateStatus", "type": "string", "enum": ["Pass", "Fail", "UnknownReviewRequired", "Waived", "Error"], "description": "单项检查状态（= CheckStatus，00 §0.4.1）。恰为 5 值，不得扩展。" },
+    "TargetType": { "title": "TargetType", "type": "string", "enum": ["consistency", "invariant", "refines", "completeness", "mutex", "safety"], "description": "验证目标类型（量化枚举，04 §7）。" },
+    "Verdict": { "title": "Verdict", "type": "string", "enum": ["sat", "unsat", "unknown", "none"], "description": "求解器原始判定；none 仅用于编译期 Error。" },
+    "Hash": { "title": "Hash", "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 摘要的小写十六进制（64 字符）。" },
+    "FixTemplateId": { "title": "FixTemplateId", "type": "string", "enum": ["FIX-1", "FIX-2", "FIX-3", "FIX-4", "FIX-5", "FIX-6", "FIX-7", "FIX-8", "FIX-9", "FIX-10", "FIX-11", "FIX-12", "FIX-13", "FIX-14", "FIX-15", "FIX-16"], "description": "修复模板 ID（07 §7.4.2）。" },
+    "VerdictFeature": { "title": "VerdictFeature", "type": "string", "enum": ["SameHostPortConflict", "DbInstanceDivergence", "OutOfSubnet", "ConflictingBoundPair", "RangeWidened", "UncoveredRegion", "MutexOverlap", "DenominatorZero", "BoundaryValue", "Timeout", "UnknownRiskLogic", "EmptyCore", "NonlinearConstruct", "GroundingBudgetExceeded", "SolverUnavailable", "CrossvalMismatch"], "description": "反例特征名（确定性判定，07 §7.4.1）。" },
+    "RefinementClass": {
+      "title": "RefinementClass",
+      "type": "string",
+      "enum": ["EQUIVALENT", "STRICT", "WIDENED", "INCOMPARABLE", "UNDETERMINED", "STRICT_OR_EQUIVALENT"],
+      "description": "refines 目标的四态分类（06 §6.3.3 / A-16 / C-12）。作为独立字段承载，不扩 GateStatus 枚举。"
+    },
+    "Sort": { "title": "Sort", "type": "string", "enum": ["Int", "Real", "Bool", "Str", "BitVec", "Enum", "IPv4", "IPv6"] },
+    "Span": {
+      "title": "Span", "type": "object", "additionalProperties": false,
+      "required": ["start_line", "start_col", "end_line", "end_col"],
+      "properties": {
+        "start_line": { "type": "integer", "minimum": 1 }, "start_col": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 }, "end_col": { "type": "integer", "minimum": 1 }
+      },
+      "description": "源码行列跨度（1 起，end 不含），与 05 §2.2 的 ast::Span 及 SARIF region 一致。"
+    },
+    "RuleConflictSpan": {
+      "title": "RuleConflictSpan", "type": "object", "additionalProperties": false,
+      "required": ["rule_name", "start_line", "start_col", "end_line", "end_col"],
+      "properties": {
+        "rule_name": { "type": "string", "minLength": 1 },
+        "start_line": { "type": "integer", "minimum": 1 }, "start_col": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 }, "end_col": { "type": "integer", "minimum": 1 }
+      },
+      "description": "冲突核归因到 DSL 规则名 + 源码四行列跨度（07 §7.3.2）。"
+    },
+    "Diagnostic": {
+      "title": "Diagnostic", "type": "object", "additionalProperties": false,
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[EW]-[A-Z0-9-]+$", "description": "错误/警告码（04 §11）。机读判定 MUST 使用本字段而非 message。" },
+        "severity": { "type": "string", "enum": ["error", "warning", "info"] },
+        "message": { "type": "string", "description": "人类可读文案；允许本地化；不参与任何哈希。" },
+        "span": { "oneOf": [{ "$ref": "#/$defs/Span" }, { "type": "null" }] },
+        "fix_template": { "oneOf": [{ "$ref": "#/$defs/FixTemplateId" }, { "type": "null" }], "description": "修复模板 ID（07 §7.4.2）。" }
+      }
+    },
+    "Remediation": {
+      "title": "Remediation", "type": "object", "additionalProperties": false,
+      "required": ["template_id", "rendered"],
+      "properties": {
+        "template_id": { "$ref": "#/$defs/FixTemplateId" },
+        "rendered": { "type": "string", "description": "占位符替换后的确定性字符串（07 §7.2.2 / §7.4.3）。" }
+      }
+    },
+    "FieldValue": {
+      "title": "FieldValue", "type": "object", "additionalProperties": false,
+      "required": ["name", "sort", "value"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 }, "sort": { "$ref": "#/$defs/Sort" },
+        "value": { "type": "string", "description": "已按 07 §7.2.2 格式化的确定性字符串。" }
+      }
+    },
+    "GlobalValue": {
+      "title": "GlobalValue", "type": "object", "additionalProperties": false,
+      "required": ["name", "sort", "value"],
+      "properties": { "name": { "type": "string", "minLength": 1 }, "sort": { "$ref": "#/$defs/Sort" }, "value": { "type": "string" } }
+    },
+    "KeyRef": {
+      "title": "KeyRef", "type": "object", "additionalProperties": false,
+      "required": ["field", "value"],
+      "properties": { "field": { "type": "string", "minLength": 1, "description": "@key 标注的业务主键字段名。" }, "value": { "type": "string" } }
+    },
+    "EntitySnapshot": {
+      "title": "EntitySnapshot", "type": "object", "additionalProperties": false,
+      "required": ["domain", "entity", "internal_index", "display_index", "primary_key", "fields"],
+      "properties": {
+        "domain": { "type": "string", "minLength": 1 }, "entity": { "type": "string", "minLength": 1 },
+        "internal_index": { "type": "integer", "minimum": 0, "description": "SMT 内部索引 i ∈ Fin N（0 起，03 §3.2.4）。" },
+        "display_index": { "type": "integer", "minimum": 1, "description": "业务显示编号 k = i + 1（1 起，07 §7.2.1）。" },
+        "primary_key": { "oneOf": [{ "$ref": "#/$defs/KeyRef" }, { "type": "null" }], "description": "@key 存在则为业务主键，否则 null。" },
+        "fields": { "type": "array", "items": { "$ref": "#/$defs/FieldValue" }, "description": "有序数组，按实体字段声明序。" }
+      }
+    },
+    "Counterexample": {
+      "title": "Counterexample", "type": "object", "additionalProperties": false,
+      "required": ["summary", "entity_snapshots", "globals"],
+      "properties": {
+        "summary": { "type": "string", "description": "业务可读摘要（L2 归因器确定性填充，07 §7.2.4）。" },
+        "entity_snapshots": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/EntitySnapshot" }, "description": "有序数组，按 internal_index 升序。" },
+        "globals": { "type": "array", "items": { "$ref": "#/$defs/GlobalValue" }, "description": "有序数组，按变量声明序。" }
+      }
+    },
+    "Waiver": {
+      "title": "Waiver", "type": "object", "additionalProperties": false,
+      "required": ["waiver_name", "target", "owner", "approver", "expires", "reason", "state"],
+      "properties": {
+        "waiver_name": { "type": "string", "minLength": 1 }, "target": { "type": "string", "minLength": 1, "description": "被豁免的检查名。" },
+        "owner": { "type": "string", "minLength": 1, "description": "责任人。" }, "approver": { "type": "string", "minLength": 1, "description": "审批人；须 ≠ owner。" },
+        "expires": { "type": "string", "format": "date", "description": "到期日（ISO-8601）。" }, "reason": { "type": "string", "minLength": 1 },
+        "state": { "type": "string", "enum": ["Active", "Expired"], "description": "Active 覆盖 Fail 为 Waived；Expired 回退 Fail 并记 W-WAIVER-EXPIRED（07 §7.9.4）。" }
+      }
+    },
+    "Check": {
+      "title": "Check", "type": "object", "additionalProperties": false,
+      "required": ["check_name", "target_type", "status", "verdict", "winning_solver", "time_ms", "conflicting_rules", "counterexample", "verdict_feature", "remediation", "diagnostics", "core_minimized"],
+      "properties": {
+        "check_name": { "type": "string", "minLength": 1, "description": "形如 <policy>::<target_type>::<symbol>。" },
+        "target_type": { "$ref": "#/$defs/TargetType" },
+        "status": { "$ref": "#/$defs/GateStatus", "description": "本检查的 GateStatus（check 级 status）。" },
+        "verdict": { "$ref": "#/$defs/Verdict" },
+        "winning_solver": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }], "description": "胜出求解器名；编译期 Error 时为 null。不进入 proof_hash（07 §7.5.6）。" },
+        "time_ms": { "type": "integer", "minimum": 0, "description": "该目标求解耗时（毫秒）。不进入 proof_hash。" },
+        "conflicting_rules": { "type": "array", "items": { "$ref": "#/$defs/RuleConflictSpan" }, "description": "冲突核归因（有序数组，按 start_line 升序）。按目标类型条件出现，见 allOf。" },
+        "counterexample": { "oneOf": [{ "$ref": "#/$defs/Counterexample" }, { "type": "null" }], "description": "反例模型还原。按目标类型条件出现，见 allOf。" },
+        "verdict_feature": { "$ref": "#/$defs/VerdictFeature" },
+        "remediation": { "$ref": "#/$defs/Remediation" },
+        "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/Diagnostic" }, "description": "编译期诊断（有序数组）。" },
+        "core_minimized": { "type": "boolean", "description": "是否已执行 Unsat Core 最小化（06 §6.9）。" },
+        "refinement_class": {
+          "oneOf": [{ "$ref": "#/$defs/RefinementClass" }, { "type": "null" }],
+          "description": "refines 目标的四态分类；非 refines 目标为 null（06 §6.3.3）。"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "target_type": { "const": "consistency" }, "status": { "const": "Fail" } }, "required": ["target_type", "status"] },
+          "then": { "properties": { "conflicting_rules": { "minItems": 1 }, "counterexample": { "type": "null" } } }
+        },
+        {
+          "if": { "properties": { "target_type": { "enum": ["invariant", "refines", "completeness", "mutex", "safety"] }, "status": { "const": "Fail" } }, "required": ["target_type", "status"] },
+          "then": { "properties": { "counterexample": { "$ref": "#/$defs/Counterexample" }, "conflicting_rules": { "maxItems": 0 } } }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["Pass", "UnknownReviewRequired", "Waived"] } }, "required": ["status"] },
+          "then": { "properties": { "counterexample": { "type": "null" } } }
+        }
+      ]
+    },
+    "Tool": { "title": "Tool", "type": "object", "additionalProperties": false, "required": ["name", "version"], "properties": { "name": { "type": "string", "minLength": 1 }, "version": { "type": "string", "minLength": 1 } } },
+    "Attestation": {
+      "title": "Attestation", "type": "object", "additionalProperties": false,
+      "required": ["winner_solver", "solver_version", "time_ms", "host", "os", "arch"],
+      "properties": {
+        "winner_solver": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "solver_version": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "null" }] },
+        "time_ms": { "type": "integer", "minimum": 0 }, "host": { "type": "string" }, "os": { "type": "string" }, "arch": { "type": "string" }
+      },
+      "description": "运行元数据（法证），进入 attestation_hash，不进入 proof_hash（07 §7.5.6）。"
+    },
+    "Summary": {
+      "title": "Summary", "type": "object", "additionalProperties": false,
+      "required": ["total", "pass", "fail", "unknown", "waived", "error"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 }, "pass": { "type": "integer", "minimum": 0 },
+        "fail": { "type": "integer", "minimum": 0 }, "unknown": { "type": "integer", "minimum": 0 },
+        "waived": { "type": "integer", "minimum": 0 }, "error": { "type": "integer", "minimum": 0 }
+      },
+      "description": "状态计数；pass+fail+unknown+waived+error 必须等于 total。"
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0",
+      "report_id": "rpt-20261014T170400Z-7c1a",
+      "timestamp": "2026-10-14T17:04:00Z",
+      "overall_status": "Fail",
+      "exit_code": 1,
+      "logic_used": "QF_SLIA",
+      "spec_hash": "9f2c0a7b5c1e4d8f3a6b2c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f",
+      "query_hash": "1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a",
+      "proof_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "attestation_hash": "f0e1d2c3b4a5968778695a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+      "tool": { "name": "policylang", "version": "2.1.0" },
+      "attestation": { "winner_solver": "cvc5", "solver_version": "1.2.0", "time_ms": 214, "host": "ci-runner-07", "os": "linux", "arch": "x86_64" },
+      "checks": [
+        {
+          "check_name": "ServiceDeploymentPolicy::invariant::PaymentSubnetIsolation",
+          "target_type": "invariant",
+          "status": "Fail",
+          "verdict": "sat",
+          "winning_solver": "cvc5",
+          "time_ms": 214,
+          "conflicting_rules": [],
+          "counterexample": {
+            "summary": "Services[3] 的 host_ip 不在 10.0.1.0/24 网段内，违反 PaymentSubnetIsolation",
+            "entity_snapshots": [
+              {
+                "domain": "Services", "entity": "Service", "internal_index": 2, "display_index": 3,
+                "primary_key": { "field": "id", "value": "42" },
+                "fields": [
+                  { "name": "id", "sort": "Int", "value": "42" },
+                  { "name": "host_ip", "sort": "IPv4", "value": "10.0.2.9" },
+                  { "name": "port", "sort": "Int", "value": "8080" },
+                  { "name": "uses_db", "sort": "Bool", "value": "true" }
+                ]
+              }
+            ],
+            "globals": [ { "name": "is_production", "sort": "Bool", "value": "true" } ]
+          },
+          "verdict_feature": "OutOfSubnet",
+          "remediation": { "template_id": "FIX-3", "rendered": "将 Services[3].host_ip（当前 10.0.2.9）调整至网段 10.0.1.0/24 内" },
+          "diagnostics": [],
+          "core_minimized": false
+        }
+      ],
+      "waivers": [],
+      "summary": { "total": 1, "pass": 0, "fail": 1, "unknown": 0, "waived": 0, "error": 0 }
+    },
+    {
+      "schema_version": "1.0",
+      "report_id": "rpt-20261014T180000Z-2f9b",
+      "timestamp": "2026-10-14T18:00:00Z",
+      "overall_status": "Fail",
+      "exit_code": 1,
+      "logic_used": "QF_LIA",
+      "spec_hash": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+      "query_hash": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+      "proof_hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "attestation_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "tool": { "name": "policylang", "version": "2.1.0" },
+      "attestation": { "winner_solver": "z3", "solver_version": "4.13.0", "time_ms": 88, "host": "ci-runner-07", "os": "linux", "arch": "x86_64" },
+      "checks": [
+        {
+          "check_name": "Deadlock::consistency::Consistency",
+          "target_type": "consistency",
+          "status": "Fail",
+          "verdict": "unsat",
+          "winning_solver": "z3",
+          "time_ms": 88,
+          "conflicting_rules": [
+            { "rule_name": "HighPort", "start_line": 30, "start_col": 5, "end_line": 31, "end_col": 48 },
+            { "rule_name": "LowPort", "start_line": 33, "start_col": 5, "end_line": 34, "end_col": 46 }
+          ],
+          "counterexample": null,
+          "verdict_feature": "ConflictingBoundPair",
+          "remediation": { "template_id": "FIX-4", "rendered": "规则 HighPort（30:5）与 LowPort（33:5）的上下界互斥；放宽其一或将交集区间纳入合法域" },
+          "diagnostics": [],
+          "core_minimized": true
+        }
+      ],
+      "waivers": [],
+      "summary": { "total": 1, "pass": 0, "fail": 1, "unknown": 0, "waived": 0, "error": 0 }
+    }
+  ]
+}

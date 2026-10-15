@@ -1,0 +1,12 @@
+[package]
+name = "policylang-diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CR-6 S-Expr 解析 / Model 还原 / Unsat Core 归因与最小化 / 业务渲染"
+
+[dependencies]
+policylang-ast.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,227 @@
+// =============================================================================
+// spec/grammar.pest — PolicyLang Meta DSL 文法（Pest 语法）· v2.1
+// -----------------------------------------------------------------------------
+// 对应文档：04 §2（文法）；00 §0.6（源文件头 `#lang policylang 2` / 扩展名 `.plm`）；
+//   03 §3.2.1（排序）；§3.3（W1–W12）；§3.4.3（运算符优先级）；§3.5.2（AX-Q-INDEP
+//   与 distinct）；§3.12.3（CIDR）；§3.13.1（正则子语言 R_sub）。
+// 修正上游 v2.0 §2.1 的四处缺陷（编号见 09 §9.2）：
+//   B-1 缺 `unique(D, f)` → unique_expr；B-2 缺布尔原子 → f_primary 新增 bool_atom；
+//   B-3 缺 `iff` → 新增 f_iff（最低优先级）；B-4 缺 `x in [a..b]` → interval_expr。
+// 另新增：字符串转义、branch/mutex/waiver/require、量词 distinct、IPv4/IPv6 别名、
+//   保留字表 reserved（保证 ident 不与关键字冲突）。注释仅用 `//`。
+// -----------------------------------------------------------------------------
+// 【实现期修正 · 词边界】原写法 `"kw" ~ boundary`（boundary = _{ !ident_char }）**不可用**：
+//   pest 会在**非原子**规则的序列元素之间自动跳过 WHITESPACE，因此该零宽断言实际落在
+//   关键字**之后的下一个词法单元**上，而非紧邻字符。反例：`entity E {...}` 中，
+//   `"entity"` 后跳过空格，断言落在 `E`（ident_char）上 ⇒ 断言失败 ⇒ 整个 entity_decl 失败。
+//   修复：所有关键字改为**原子**规则 `kw_x = @{ "x" ~ !ident_char }`（原子规则内不跳过空白，
+//   断言紧贴关键字）。`reserved` 改为对同一批 kw_* 的引用，避免两份关键字表漂移。
+//   该缺陷为文法首次编译时发现（原冻结文法从未经 `pest_derive` 编译验证）。
+// =============================================================================
+
+// —— 0. 词法与词边界 ——
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT    = _{ "//" ~ (!"\n" ~ ANY)* }
+ident_char = _{ ASCII_ALPHANUMERIC | "_" }
+
+// —— 0.1 关键字（原子 + 紧邻词边界断言）——
+kw_entity       = @{ "entity"       ~ !ident_char }
+kw_domain       = @{ "domain"       ~ !ident_char }
+kw_var          = @{ "var"          ~ !ident_char }
+kw_policy       = @{ "policy"       ~ !ident_char }
+kw_rule         = @{ "rule"         ~ !ident_char }
+kw_branch       = @{ "branch"       ~ !ident_char }
+kw_mutex        = @{ "mutex"        ~ !ident_char }
+kw_invariant    = @{ "invariant"    ~ !ident_char }
+kw_verify       = @{ "verify"       ~ !ident_char }
+kw_waiver       = @{ "waiver"       ~ !ident_char }
+kw_require      = @{ "require"      ~ !ident_char }
+kw_forall       = @{ "forall"       ~ !ident_char }
+kw_exists       = @{ "exists"       ~ !ident_char }
+kw_distinct     = @{ "distinct"     ~ !ident_char }
+kw_in           = @{ "in"           ~ !ident_char }
+kw_matches_all  = @{ "matches_all"  ~ !ident_char }
+kw_in_cidr      = @{ "in_cidr"      ~ !ident_char }
+kw_in_range     = @{ "in_range"     ~ !ident_char }
+kw_unique       = @{ "unique"       ~ !ident_char }
+kw_and          = @{ "and"          ~ !ident_char }
+kw_or           = @{ "or"           ~ !ident_char }
+kw_not          = @{ "not"          ~ !ident_char }
+kw_implies      = @{ "implies"      ~ !ident_char }
+kw_iff          = @{ "iff"          ~ !ident_char }
+kw_Int          = @{ "Int"          ~ !ident_char }
+kw_Real         = @{ "Real"         ~ !ident_char }
+kw_Bool         = @{ "Bool"         ~ !ident_char }
+kw_String       = @{ "String"       ~ !ident_char }
+kw_IPv4         = @{ "IPv4"         ~ !ident_char }
+kw_IPv6         = @{ "IPv6"         ~ !ident_char }
+kw_BitVec       = @{ "BitVec"       ~ !ident_char }
+kw_Enum         = @{ "Enum"         ~ !ident_char }
+kw_Set          = @{ "Set"          ~ !ident_char }
+kw_true         = @{ "true"         ~ !ident_char }
+kw_false        = @{ "false"        ~ !ident_char }
+kw_min          = @{ "min"          ~ !ident_char }
+kw_max          = @{ "max"          ~ !ident_char }
+kw_length       = @{ "length"       ~ !ident_char }
+kw_size         = @{ "size"         ~ !ident_char }
+kw_div          = @{ "div"          ~ !ident_char }
+kw_mod          = @{ "mod"          ~ !ident_char }
+kw_consistency  = @{ "consistency"  ~ !ident_char }
+kw_refines      = @{ "refines"      ~ !ident_char }
+kw_completeness = @{ "completeness" ~ !ident_char }
+kw_safety       = @{ "safety"       ~ !ident_char }
+kw_under        = @{ "under"        ~ !ident_char }
+kw_of           = @{ "of"           ~ !ident_char }
+kw_to_real      = @{ "to_real"      ~ !ident_char }
+kw_int2bv       = @{ "int2bv"       ~ !ident_char }
+kw_bv2int       = @{ "bv2int"       ~ !ident_char }
+kw_str_len      = @{ "str.len"      ~ !ident_char }
+
+// 保留字：不得用作实体名/域变量名/字段名/规则名/分支名（见 04 §3.1）。
+// 由 kw_* 派生，保证与关键字表**同源**。
+reserved = _{
+      kw_entity | kw_domain | kw_var | kw_policy | kw_rule | kw_branch | kw_mutex
+    | kw_invariant | kw_verify | kw_waiver | kw_require
+    | kw_forall | kw_exists | kw_distinct | kw_in
+    | kw_matches_all | kw_in_cidr | kw_in_range | kw_unique
+    | kw_and | kw_or | kw_not | kw_implies | kw_iff
+    | kw_Int | kw_Real | kw_Bool | kw_String | kw_IPv4 | kw_IPv6 | kw_BitVec | kw_Enum | kw_Set
+    | kw_true | kw_false | kw_min | kw_max | kw_length | kw_size | kw_div | kw_mod
+    | kw_consistency | kw_refines | kw_completeness | kw_safety | kw_under | kw_of
+    | kw_to_real | kw_int2bv | kw_bv2int | kw_str_len
+}
+ident = @{ !reserved ~ (ASCII_ALPHA | "_") ~ ident_char* }
+
+// —— 1. 源文件与头部（00 §0.6）——
+spec_file   = { SOI ~ lang_header ~ decl* ~ EOI }
+lang_header = { "#lang" ~ "policylang" ~ version }
+version     = @{ ASCII_DIGIT+ }
+decl = _{
+      entity_decl | domain_decl | var_decl
+    | policy_decl | invariant_decl | verify_decl
+    | waiver_decl | require_decl
+}
+
+// —— 2. 实体（记录模式 Schema(E)，03 §3.2.4 定义 3.2.1）——
+entity_decl = { kw_entity ~ ident ~ "{"
+              ~ (field_decl ~ ("," ~ field_decl)* ~ ","?)? ~ "}" }
+field_decl  = { key_annotation? ~ ident ~ ":" ~ type_expr ~ ("[" ~ range_constraint ~ "]")? }
+// 业务主键标注（07 §7.2.1 的规范形态 `@key id: Int[min:1,max:100]`）。
+// 语义与展示规则见 07 §7.2.1；本产生式为对 04 §2 的补齐（对应 08 §8.8.3 INC-3）。
+key_annotation = @{ "@key" ~ !ident_char }
+
+// —— 3. 有限集合域（实例域 idx(D) = Fin N，03 §3.2.4 定义 3.2.2）——
+domain_decl = { kw_domain ~ ident ~ ":" ~ kw_Set
+              ~ "[" ~ ident ~ "]" ~ "[" ~ kw_size ~ ":" ~ int_lit ~ "]" }
+
+// —— 4. 全局变量（GVar，03 §3.2.4 定义 3.2.4）——
+var_decl = { kw_var ~ ident ~ ":" ~ type_expr
+           ~ ("[" ~ range_constraint ~ "]")? }
+
+// —— 5. 排序（IPv4/IPv6 为 BitVec 别名，见 04 §4）——
+type_expr = {
+      kw_Int | kw_Real | kw_Bool | kw_String
+    | kw_IPv4                                               // ≡ BitVec(32)
+    | kw_IPv6                                               // ≡ BitVec(128)
+    | (kw_BitVec ~ "(" ~ int_lit ~ ")")
+    | (kw_Enum ~ "{" ~ ident ~ ("," ~ ident)* ~ "}")
+}
+range_constraint = {
+      (kw_min ~ ":" ~ number ~ "," ~ kw_max ~ ":" ~ number)
+    | (kw_length ~ ":" ~ int_lit ~ ".." ~ int_lit)
+}
+
+// —— 6. 策略集：rule / branch（completeness 用）/ mutex（互斥声明）——
+policy_decl = { kw_policy ~ ident ~ "{" ~ policy_item* ~ "}" }
+policy_item = _{ rule_decl | branch_decl | mutex_decl }
+rule_decl   = { kw_rule ~ ident ~ ":" ~ formula }
+branch_decl = { kw_branch ~ ident ~ ":" ~ formula }
+mutex_decl  = { kw_mutex ~ ident ~ ("," ~ ident)+ }
+
+// —— 7. 不变量与强制义务 ——
+invariant_decl = { kw_invariant ~ ident ~ "{" ~ formula ~ "}" }
+require_decl   = { kw_require ~ ident ~ ":" ~ formula }
+
+// —— 8. 豁免（带责任人/审批人/到期日的限时例外，00 §0.3.2）——
+waiver_decl  = { kw_waiver ~ ident ~ "{" ~ waiver_field+ ~ "}" }
+waiver_field = { waiver_key ~ ":" ~ (string_lit | ident) }
+waiver_key   = @{ ("target" | "owner" | "approver" | "expires" | "reason") ~ !ident_char }
+
+// —— 9. 验证目标（六大目标，见 04 §7）——
+verify_decl = {
+      (kw_verify ~ kw_consistency  ~ kw_of  ~ ident)
+    | (kw_verify ~ kw_invariant    ~ ident ~ kw_under ~ ident)
+    | (kw_verify ~ ident ~ kw_refines ~ ident)
+    | (kw_verify ~ kw_completeness ~ kw_of  ~ ident)
+    | (kw_verify ~ kw_safety       ~ kw_of  ~ ident)
+    | (kw_verify ~ kw_mutex        ~ kw_of  ~ ident)
+}
+
+// —— 10. 一阶公式：优先级严格对应 03 §3.4.3 ——
+formula   = { f_iff }
+f_iff     = { f_implies ~ (kw_iff ~ f_iff)? }        // 右结合，最低优先级
+f_implies = { f_or ~ (kw_implies ~ f_implies)? }     // 右结合
+f_or      = { f_and ~ (kw_or ~ f_and)* }             // 左结合
+f_and     = { f_not ~ (kw_and ~ f_not)* }            // 左结合
+f_not     = { (kw_not ~ f_not) | f_primary }
+f_primary = {
+      quantifier_expr | in_cidr_expr | in_range_expr | unique_expr
+    | interval_expr | matches_all_expr | predicate | bool_atom
+    | ("(" ~ formula ~ ")")
+}
+// 有界量词：forall|exists x̄ in D [distinct]: φ（AX-Q-INDEP，03 §3.5.2）
+quantifier_expr  = { (kw_forall | kw_exists)
+                   ~ ident_list ~ kw_in ~ ident
+                   ~ distinct_marker? ~ ":" ~ formula }
+// 单射枚举修饰（Inj）。具名产生式以便 AST 构造阶段识别。
+distinct_marker  = @{ "distinct" ~ !ident_char }
+ident_list       = { ident ~ ("," ~ ident)* }
+// 正则交集：e matches_all [r₁, …, r_k]（R_sub，03 §3.13.1）
+matches_all_expr = { expr ~ kw_matches_all
+                   ~ "[" ~ string_lit ~ ("," ~ string_lit)* ~ "]" }
+// CIDR：in_cidr(e, "a.b.c.d/p") / in_cidr(e, "2001:db8::/32")（03 §3.12.3）
+in_cidr_expr     = { kw_in_cidr ~ "(" ~ expr ~ "," ~ string_lit ~ ")" }
+// 非对齐地址段：in_range(e, "lo", "hi")（03 §3.12.3）
+in_range_expr    = { kw_in_range ~ "(" ~ expr ~ "," ~ string_lit ~ "," ~ string_lit ~ ")" }
+// 集合字段唯一性：unique(D, f)（03 §3.4.2 T-UNIQUE）
+unique_expr      = { kw_unique ~ "(" ~ ident ~ "," ~ ident ~ ")" }
+// 区间成员：x in [a..b]（03 §3.4.2 T-INRANGE）
+interval_expr    = { expr ~ kw_in ~ "[" ~ expr ~ ".." ~ expr ~ "]" }
+predicate = { expr ~ cmp_op ~ expr }
+cmp_op    = { "str.<=" | "str.<" | "==" | "!=" | ">=" | "<=" | ">" | "<" }
+// 布尔原子：使纯 Bool 表达式上升为 formula（03 §3.4.2 T-BOOL-ATOM）
+bool_atom = { expr }
+
+// —— 11. 表达式 ——
+// 说明：`add_op` / `mul_op` 为**非沉默**产生式，使 AST 构造阶段可从 Pair 树中取出运算符
+// （沉默规则不产生 Pair，无法在 P2 还原运算符）。
+expr   = { term ~ (add_op ~ term)* }
+term   = { factor ~ (mul_op ~ factor)* }
+add_op = { "+" | "-" }
+mul_op = { "*" | "/" | kw_div | kw_mod }
+factor = {
+      str_len | cast_expr | bv_call | field_access
+    | number | bool_lit | string_lit | ident
+    | ("(" ~ expr ~ ")") | ("-" ~ factor)
+}
+field_access = { ident ~ "." ~ ident }
+str_len      = { kw_str_len ~ "(" ~ expr ~ ")" }
+cast_expr    = {
+      (kw_to_real ~ "(" ~ expr ~ ")")                    // Int → Real 显式提升（N-4）
+    | (kw_int2bv ~ "(" ~ int_lit ~ "," ~ expr ~ ")")     // Int → BV(n)
+    | (kw_bv2int ~ "(" ~ expr ~ ")")                     // BV → Int（编译期拒绝）
+}
+bv_call = { bv_op ~ "(" ~ expr ~ "," ~ expr ~ ")" }
+bv_op   = @{ "bv" ~ ("and" | "or" | "xor" | "not" | "add" | "sub" | "mul" | "shl" | "lshr") }
+
+// —— 12. 字面量与字符串转义 ——
+number   = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+int_lit  = @{ ASCII_DIGIT+ }
+bool_lit = { (kw_true | kw_false) }
+string_lit = @{ "\"" ~ str_char* ~ "\"" }
+str_char   = _{ escape_seq | (!("\"" | "\\") ~ ANY) }
+escape_seq = @{
+      "\\" ~ ("\\" | "\"" | "n" | "t" | "r")               // 基础转义
+    | "\\" ~ "x" ~ ASCII_HEX_DIGIT{2}                       // \xHH
+    | "\\" ~ "u" ~ ASCII_HEX_DIGIT{4}                       // \uHHHH
+}

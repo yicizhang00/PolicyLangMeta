@@ -1,0 +1,67 @@
+// =============================================================================
+// examples/exchange-compliance.plm — 金融监管合规验证案例
+// 用途    : 覆盖 G-1/G-3 的合规实例（FR-1/2/3/5/6；AC-4/AC-5）。
+//           重点演示正则交集(matches_all)、长度约束(str.len)、枚举(Enum)、网段隔离不变量。
+// 预期判定: consistency => PASS(0) | invariant => PASS(0)
+//           注释变体 A（变量相乘）=> E-NONLINEAR，COMPILE_ERROR(3)
+// 逻辑档位: QF_SLIA(String + str.len + RegLan + Int)，可判定(03 §3.10.2)，不调度纯 BV 后端(AC-5)。
+// 说明    : 必须可被 spec/grammar.pest 完整解析。
+// =============================================================================
+
+#lang policylang 2
+
+entity Account {
+    id: Int [min: 1, max: 10000],
+    ip: IPv4,                                        // 登录来源网段（≡ BitVec(32)）
+    account_no: String [length: 8..32],              // 账号
+    balance: Int [min: 0, max: 100000000],           // 余额（分）
+    kyc_level: Enum { Basic, Enhanced, Institutional }, // Enum(E)，k=3，编码为 Int + 成员闭包
+    risk_score: Int [min: 0, max: 100]
+}
+
+domain Accounts: Set[Account] [size: 8]
+
+var trading_enabled: Bool
+var global_daily_limit: Int [min: 1000, max: 10000000]
+
+// 安全不变量：机构账户必须来自受监管网段 10.10.0.0/16
+invariant RegulatedSubnetIsolation {
+    forall a in Accounts:
+        a.kyc_level == Institutional implies in_cidr(a.ip, "10.10.0.0/16")
+    // => Enum 比较用 T-CMP-ENUM(= / ≠)；in_cidr 用 bvand + =(03 §3.12.3)
+}
+
+policy ExchangeCompliancePolicy {
+    // 规则 1：账号格式 = 以大写字母开头 且 含数字 且 长度 ≥ 8
+    rule AccountNumberFormat:
+        forall a in Accounts:
+            a.account_no matches_all ["[A-Z].*", ".*[0-9].*"] and str.len(a.account_no) >= 8
+        // => (str.in_re e (re.inter τ(r₁) τ(r₂)))（03 §3.13.3 TH-6-C1）
+
+    // 规则 2：高风控账户禁止开启交易（布尔原子参与蕴含）
+    rule HighRiskBlocked:
+        forall a in Accounts:
+            a.risk_score >= 80 implies not trading_enabled
+        // => `not trading_enabled` 经 f_not → bool_atom 上升为公式(03 §3.4.2)
+
+    // 规则 3：机构账户必须走隔离网段（与不变量同源，固化为策略约束）
+    rule InstitutionalIsolation:
+        forall a in Accounts:
+            a.kyc_level == Institutional implies in_cidr(a.ip, "10.10.0.0/16")
+
+    // 规则 4：账号唯一性——禁止两个账户共用同一账号
+    rule UniqueAccountNo:
+        unique(Accounts, account_no)                 // => ⋀_{i<j}(account_no_i ≠ account_no_j)
+}
+
+require DailyLimitPositive: global_daily_limit in [1..10000000]
+
+verify consistency of ExchangeCompliancePolicy                          // => PASS, exit 0
+verify invariant RegulatedSubnetIsolation under ExchangeCompliancePolicy // => PASS, exit 0
+
+// 变体 A（AC-4 非线性静态拦截）：
+//   rule NonLinearRisk: forall a in Accounts: a.balance * a.risk_score > 1000000
+//   // => E-NONLINEAR（`*` 两侧皆非常量），exit 3，不进求解阶段。
+// 变体 B（可变除数 + TH-4 线性化）：除数非常量、比较右侧为常量 100 ⇒ LinDiv 成立，自动线性化；
+//   若比较右侧亦为变量则 LinDiv 不成立 ⇒ E-NONLINEAR(03 §3.11.3)。
+//   rule RatioCheck: forall a in Accounts: a.balance / a.risk_score > 100

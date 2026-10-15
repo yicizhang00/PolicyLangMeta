@@ -1,0 +1,84 @@
+// =============================================================================
+// examples/cloud-deployment.plm — 云服务部署拓扑验证案例
+// 用途    : 覆盖 G-1/G-3 的云部署实例（FR-1/2/3/4/5/6/7；AC-1/2/3）。
+// 预期判定: consistency => PASS(0) | invariant => PASS(0) | safety => PASS(0, safety_vacuous)
+//           NewPolicy refines OldPolicy => FAIL(1, 反例 port=80)
+//           注释变体 B 的冲突策略 => FAIL(1, Unsat Core = {HighPort, LowPort})
+// 逻辑档位: QF_BV(host_ip: IPv4≡BitVec(32)) + QF_SLIA(matches_all) → 组合逻辑，走能力探测(03 §3.10.3)。
+// 说明    : 必须可被 spec/grammar.pest 完整解析。
+// =============================================================================
+
+#lang policylang 2
+
+entity Service {
+    id: Int [min: 1, max: 100],              // 服务编号（AC-1 反例报告使用）
+    host_ip: IPv4,                           // 宿主 IPv4（≡ BitVec(32)）
+    port: Int [min: 1, max: 65535],
+    uses_db: Bool,
+    db_host: String [length: 1..64],
+    db_port: Int [min: 1, max: 65535],
+    db_password: String [length: 12..32],
+    subnet_id: Int [min: 1, max: 10]
+}
+
+domain Services: Set[Service] [size: 4]      // 展开为 4 组独立标量（03 §3.2.4）
+
+var is_production: Bool
+var global_max_connections: Int [min: 10, max: 10000]
+
+policy ServiceDeploymentPolicy {
+    // 规则 1：使用数据库的服务必须连接同一数据库实例（同 host + 同 port）
+    rule SameDatabase:
+        forall s1, s2 in Services:
+            (s1.uses_db and s2.uses_db) implies
+                (s1.db_host == s2.db_host and s1.db_port == s2.db_port)
+        // => AX-Q-INDEP 允许 s1=s2，故无需守卫
+
+    // 规则 2：同一宿主机上两个不同服务端口不得冲突
+    rule NoPortConflict:
+        forall s1, s2 in Services:
+            (s1.id != s2.id and s1.host_ip == s2.host_ip) implies
+                (s1.port != s2.port)
+        // => s1.id != s2.id 是 AX-Q-INDEP 对角项所必需（03 §3.5.2）；AC-1 变体见文末
+
+    // 规则 3：口令须同时含大写字母与数字 → re.inter 正则交集
+    rule PasswordComplexity:
+        forall s in Services:
+            s.uses_db implies s.db_password matches_all [".*[A-Z].*", ".*[0-9].*"]
+}
+
+// 安全不变量：使用数据库的服务必须落在受控子网 10.0.1.0/24 内
+invariant PaymentSubnetIsolation {
+    forall s in Services:
+        s.uses_db implies in_cidr(s.host_ip, "10.0.1.0/24")
+    // => (= (bvand e (_ bv4294967040 32)) (_ bv167772416 32))，TH-5 保证等价
+}
+
+require GlobalLimitPositive: global_max_connections in [1..10000]   // 不可豁免的强制义务
+
+waiver LegacyPortsMigration {                                        // 限时豁免（00 §0.3.2）
+    target: NoPortConflict
+    owner: "alice"
+    approver: "bob"
+    expires: "2027-01-01"
+    reason: "legacy dual-stack gateway pending decommission"
+}
+
+verify consistency of ServiceDeploymentPolicy                          // => PASS, exit 0
+verify invariant PaymentSubnetIsolation under ServiceDeploymentPolicy  // => PASS, exit 0
+verify safety of ServiceDeploymentPolicy                               // => PASS(safety_vacuous), exit 0
+
+// AC-3：新策略放宽端口下界 → 扩大暴露面 → FAIL（反例 port=80）
+policy OldPolicy { rule PortRange: forall s in Services: s.port in [1024..65535] }
+policy NewPolicy { rule PortRange: forall s in Services: s.port in [80..65535] }
+verify NewPolicy refines OldPolicy                                     // => FAIL, exit 1（port=80）
+
+// 变体 A（AC-1 端口冲突反例）：把规则 2 换成无守卫的 distinct 版本，同 IP 同端口即 SAT：
+//   rule NoPortConflict: forall s1, s2 in Services distinct:
+//       (s1.host_ip == s2.host_ip) implies (s1.port != s2.port)   // distinct 单射：4*3=12 组合
+// 变体 B（AC-2 规则死锁）：
+//   policy ConflictingPolicy {
+//       rule HighPort: forall s in Services: s.port > 8000
+//       rule LowPort:  forall s in Services: s.port < 5000
+//   }
+//   verify consistency of ConflictingPolicy   // => FAIL(UNSAT), exit 1，Core={HighPort, LowPort}

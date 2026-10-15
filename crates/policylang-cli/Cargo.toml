@@ -1,0 +1,29 @@
+[package]
+name = "policylang-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CR-8 命令行工具与 CI 门禁入口（policylang）"
+
+[[bin]]
+name = "policylang"
+path = "src/main.rs"
+
+[[bin]]
+name = "pl-stub-solver"
+path = "src/bin/pl-stub-solver.rs"
+
+[dependencies]
+policylang-ast.workspace = true
+policylang-parser.workspace = true
+policylang-check.workspace = true
+policylang-codegen.workspace = true
+policylang-solver.workspace = true
+policylang-diagnostics.workspace = true
+policylang-governance.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+policylang-governance.workspace = true
