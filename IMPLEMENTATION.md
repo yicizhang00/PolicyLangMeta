@@ -5,10 +5,11 @@
 
 | 项 | 值 |
 |---|---|
-| 规模 | **15,596 行 Rust**（8 个 crate） |
-| 测试 | **161 个自动化测试，全部通过**（0 失败、0 编译告警） |
-| 外部依赖 | `pest` / `pest_derive` / `serde` / `serde_json` / `sha2` / `hex` / `thiserror` —— **全部为标准生态库**；**未引入** tokio / clap / regex / rfc8785（见 §6.3） |
-| 构建 | **完全离线**（`cargo build --offline`），无网络、无求解器即可构建与测试 |
+| 规模 | **18,898 行 Rust**（8 个 crate / 48 个文件） |
+| 测试 | **213 个自动化测试，全部通过**（0 失败、0 编译告警） |
+| 外部依赖 | `pest` / `pest_derive` / `serde` / `serde_json` / `sha2` / `hex` / `thiserror`；**未引入** tokio / clap / regex / rfc8785（见 §6.1 的等价替换论证） |
+| 构建 | **可离线**（`cargo build --offline`）；无求解器也能构建与测试 |
+| 求解器 | **已接入真实 z3 5.3.0 / cvc5 1.4.2 / bitwuzla 0.9.1**，端到端判定与证明校验均已跑通 |
 | 入口可执行 | `policylang`（8 个子命令）、`pl-stub-solver`（**流水线测试桩**，非真求解器） |
 
 ---
@@ -269,15 +270,26 @@ examples/marketing-coupon.plm: 检查通过（逻辑档位: CouponDispatchPolicy
 
 ### 6.3 有意未实现 / 受限项
 
+**已全部实现**（本轮补齐）：
+
+| 项 | 实现 | 验证 |
+|---|---|---|
+| `--enum-encoding=datatype` | `declare-datatype` 编码 + 零元构造子；闭集类型无需成员闭包断言（`DD-6.2`） | 实测 z3/cvc5 通过；模型还原走 `PL_M_` 前缀（`naming::unescape`） |
+| `--counterexample-interval` | 反例区间化（`06 §6.3.7`）：固定其余符号 + `minimize`/`maximize` + `:opt.priority box` ⇒ **每字段单次查询**取双端点 | `cloud-deployment` 实测给出 `port ∈ [80, 65535]`、`id ∈ [1, 100]` |
+| `policylang.lock` | 生成（`policylang lock`）+ 启动校验 + `E-SOLVER-VERSION` / `--allow-version-drift` 降级 + 路径可移植化（`06 §6.5.2`） | 5 个端到端用例（摘要不符阻断、漂移降级、可选缺失剔除、必需缺失阻断） |
+| UNSAT 证明检查 | Alethe **结构级**校验（`06 §6.7.2`，`--check-proof`）：末步须为 `false`、不得含 `hole`、前提不得悬空、假设须与本次查询相关 | 实测 cvc5 证明全部通过；**「无法校验」与「校验失败」严格区分**（前者不降级） |
+| SARIF 全字段 | `rules`（`fullDescription`/`helpUri`/`help`/`defaultConfiguration`/`tags`）、`results`（`ruleIndex`/`message.markdown`/`partialFingerprints`/`fixes`/`relatedLocations`）、`invocations.toolExecutionNotifications` | 2 个结构/稳定性用例；顺带修复 `rules[]` 少一层 `}` 导致 SARIF 非法的缺陷 |
+| 求解器发现 | `PATH` → `POLICYLANG_SOLVER_PATH` → 用户级安装根**递归**查找（无需改 `PATH`） | `scripts/install-solvers.sh` 一键安装 |
+| `Optimize` 能力探测 | `f_optimize`（`ALG-3` 实测） | z3=true / cvc5=false / bitwuzla=false（与实际一致） |
+
+**仍未实现**（诚实披露）：
+
 | 项 | 说明 |
 |---|---|
-| `--enum-encoding=datatype` | `DD-6.2` 保留开关；实现**只支持有界整数编码**（默认），datatype 路径未实现（需 `ALG-3` 确认后端支持相应档位） |
-| `--counterexample-interval` | `06 §6.3.7` 的「反例区间化」未实现（需额外查询）；反例以单点 + 完整实例快照呈现 |
-| `--incremental-single-solver` 批量排查 | `CO-4`/`DD-6.1` 的例外通道未实现（默认一目标一查询已实现） |
-| `policylang.lock` 写入 | 目前只读校验语义在 `probe`/`route` 中体现；**未**实现 lock 文件生成与 SHA-256 锁定写入（需真实求解器） |
-| `UNAVAILABLE`: Alethe 证明检查 | `06 §6.7.2` 的 UNSAT 证明检查未实现（依赖后端 `get-proof`）；`ALG-3` 已探测 `f_proof` 特性位 |
-| Lean 差分测试 `DT-1`–`DT-5` | 需 Lean 侧打印器与 Lean 工具链；本轮未实现（`12 §12.5.3`） |
-| SARIF 全字段 | 输出最小可用集合（`rules`/`results`/`locations`/`properties`）；`codeFlows`、`fixes` 等未输出 |
+| `--incremental-single-solver` 批量排查 | `CO-4`/`DD-6.1` 的例外通道；默认「一目标一查询」已实现且为规范推荐路径 |
+| Lean 差分测试 `DT-1`–`DT-5` | 需 Lean 工具链与 Lean 侧 SMT-LIB2 打印器（`12 §12.5.3`）；本机未安装 Lean |
+| 求解器沙箱（`06 §6.5.3`） | `setrlimit` / `CreateJobObject` 资源限制与**环境白名单**未实现（当前仅用 wall-clock 强杀 + 独立临时工作目录） |
+| Alethe 的**规则级**语义检查 | 当前为**结构级**校验；完备的证明检查器需要实现 Alethe 规则语义 |
 
 ---
 

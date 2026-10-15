@@ -64,6 +64,8 @@ pub struct VerifyOptions {
     pub counterexample_interval: bool,
     /// 区间化的**总**时间预算（毫秒，默认 500）。
     pub interval_budget_ms: u64,
+    /// `--check-proof`：对 `unsat` 结果追加 UNSAT 证明的结构性校验（`06 §6.7.2`）。默认关闭。
+    pub check_proof: bool,
 }
 
 impl Default for VerifyOptions {
@@ -90,6 +92,7 @@ impl Default for VerifyOptions {
             enum_encoding: EnumEncoding::default(),
             counterexample_interval: true,
             interval_budget_ms: 500,
+            check_proof: false,
         }
     }
 }
@@ -441,6 +444,7 @@ fn solve_one(
             diagnostics: diags,
             core_minimized: false,
             refinement_class: None,
+            proof_checked: None,
         };
         return (check, qh);
     }
@@ -501,6 +505,88 @@ fn solve_one(
     } else {
         GateStatus::Fail
     };
+
+    // ── UNSAT 证明的结构性校验（`06 §6.7.2`，`--check-proof`）──
+    // 只在 `unsat`（即 `Pass`）且后端实测支持 `get-proof`（`f_proof`）时执行。
+    // **校验失败 ⇒ 不得采信该 `unsat`**：把 status 降级为 `UnknownReviewRequired`
+    // 并清空 Unsat Core（核为空 ⇒ 下游的冲突核归因与反例均为空，符合 schema 的
+    // `allOf` 约束），同时给出 `W-PROOF-CHECK-FAILED` 作为**诚实标注**（`G-8`）。
+    let mut proof_checked: Option<bool> = None;
+    let mut status = status;
+    let mut core = core;
+    if opts.check_proof && status == GateStatus::Pass && verdict == Verdict::Unsat && !r.is_empty() {
+        let proof_budget = opts.timeout.saturating_mul(4).max(Duration::from_secs(5));
+        // 优先选 **Alethe 后端**（cvc5）：z3 的 `get-proof` 是私有格式，无法结构性校验。
+        // 若无 Alethe 后端则退而用任一 `f_proof` 后端，其结果只会被记为「未能校验」。
+        let proof_backend = r
+            .backends
+            .iter()
+            .find(|b| b.name == "cvc5" && caps.iter().any(|c| c.name == b.name && c.available && c.f_proof))
+            .or_else(|| {
+                r.backends.iter().find(|b| {
+                    caps.iter()
+                        .any(|c| c.name == b.name && c.available && c.f_proof)
+                })
+            });
+        if let Some(be) = proof_backend {
+            let script = policylang_solver::build_proof_script(&q.canonical());
+            let argv = policylang_solver::stdin_argv(&be.name, Some(proof_budget));
+            let pr = policylang_solver::run_captured_argv(
+                &be.path,
+                &argv,
+                Some(&script),
+                proof_budget,
+            );
+            let pc = match policylang_solver::extract_proof(&pr.stdout) {
+                Some(text) => policylang_solver::check_alethe(
+                    &text,
+                    &policylang_solver::asserted_forms(&q.canonical()),
+                ),
+                None => policylang_solver::ProofCheck {
+                    checked: false,
+                    is_alethe: false,
+                    steps: 0,
+                    assumptions: 0,
+                    has_hole: false,
+                    errors: vec![format!(
+                        "后端 `{}` 未返回证明（get-proof 无有效响应；timed_out={}）",
+                        be.name, pr.timed_out
+                    )],
+                    notes: Vec::new(),
+                },
+            };
+            if !pc.is_alethe {
+                // **无法校验**（后端输出私有证明格式）≠ **校验失败**：
+                // 不得据此降级（否则装了 z3 就永远得不到 Pass）。
+                // 记为「未校验」并留下可审计的说明。
+                diags.push(Diagnostic::warning(
+                    W_PROOF_CHECK_FAILED,
+                    format!(
+                        "`{}` 的证明未能结构性校验（后端 `{be_name}`）：不构成失败，`proof_checked` 记为 null；原因：{reasons}",
+                        q.goal_name,
+                        be_name = be.name,
+                        reasons = pc.errors.join("；")
+                    ),
+                ));
+                proof_checked = None;
+            } else {
+                // Alethe 证明：结构校验失败 ⇒ **不得采信**该 `unsat`
+                proof_checked = Some(pc.checked);
+                if !pc.checked {
+                    diags.push(Diagnostic::warning(
+                        W_PROOF_CHECK_FAILED,
+                        format!(
+                            "`{}` 的 Alethe 证明未通过结构校验 ⇒ 该判定不可采信，已降级为 `UnknownReviewRequired`：{}",
+                            q.goal_name,
+                            pc.summary()
+                        ),
+                    ));
+                    status = GateStatus::UnknownReviewRequired;
+                    core.clear();
+                }
+            }
+        }
+    }
 
     // 空真检测（06 §6.3.7）
     let vacuous = match (&q.refutation_label, status, verdict) {
@@ -639,6 +725,7 @@ fn solve_one(
         diagnostics: diags,
         core_minimized,
         refinement_class: None,
+            proof_checked,
     };
     (check, qh)
 }
@@ -721,6 +808,7 @@ fn solve_refines(
         diagnostics: diags,
         core_minimized: c1.core_minimized && c2.core_minimized,
         refinement_class: Some(class.to_string()),
+        proof_checked: None,
     };
     if status != GateStatus::Fail {
         check.counterexample = None;
@@ -770,6 +858,7 @@ fn compile_error_checks(spec: &policylang_ast::Spec, diags: &[Diagnostic]) -> Ve
             diagnostics: diags.to_vec(),
             core_minimized: false,
             refinement_class: None,
+            proof_checked: None,
         });
     } else {
         for v in &spec.verifies {
@@ -790,6 +879,7 @@ fn compile_error_checks(spec: &policylang_ast::Spec, diags: &[Diagnostic]) -> Ve
                 diagnostics: diags.to_vec(),
                 core_minimized: false,
                 refinement_class: None,
+            proof_checked: None,
             });
         }
     }

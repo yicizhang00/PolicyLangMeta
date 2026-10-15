@@ -15,12 +15,14 @@ pub mod invocation;
 pub mod lockfile;
 pub mod orchestra;
 pub mod probe;
+pub mod proofcheck;
 pub mod response;
 pub mod router;
 
 pub use crossval::{eval_formula, reglan_full_match, replay, Replay};
 pub use discover::{base_name, default_roots, ENV_SEARCH_PATH};
 pub use interval::{build_interval_script, interval_from_objectives};
+pub use proofcheck::{asserted_forms, build_proof_script, check_alethe, extract_proof, ProofCheck};
 pub use invocation::{proof_hint, stdin_argv};
 pub use lockfile::{
     excluded_backends, is_blocking, normalize_version, sha256_file, verify_lock, Drift, DriftKind,

@@ -383,6 +383,7 @@ mod tests {
             diagnostics: vec![],
             core_minimized: false,
             refinement_class: None,
+            proof_checked: None,
         }]);
         let s = to_sarif(&r);
         // 必须是**合法 JSON**（历史缺陷：`rules[]` 少一层 `}` 导致整份 SARIF 非法）
@@ -424,6 +425,7 @@ mod tests {
             diagnostics: vec![],
             core_minimized: true,
             refinement_class: None,
+            proof_checked: None,
         };
         let a: serde_json::Value = serde_json::from_str(&to_sarif(&report_with(vec![mk("Pass")]))).unwrap();
         let b: serde_json::Value = serde_json::from_str(&to_sarif(&report_with(vec![mk("Fail")]))).unwrap();
@@ -466,6 +468,7 @@ mod tests {
             diagnostics: vec![],
             core_minimized: false,
             refinement_class: None,
+            proof_checked: None,
         }]);
         let s = to_sarif(&r);
         assert!(s.contains("\"version\":\"2.1.0\""));
@@ -497,6 +500,7 @@ mod tests {
             diagnostics: vec![],
             core_minimized: true,
             refinement_class: None,
+            proof_checked: None,
         }]);
         let s = to_sarif(&r);
         assert!(s.contains("\"level\":\"none\""));

@@ -90,6 +90,12 @@ pub struct Check {
     /// `refines` 目标的四态分类（`EQUIVALENT`/`STRICT`/`WIDENED`/`INCOMPARABLE`/`UNDETERMINED`）；
     /// 非 `refines` 目标为 `null`（`06 §6.3.3`，对应 `A-16`/`C-12` 的裁决）。
     pub refinement_class: Option<String>,
+    /// UNSAT 证明的**结构性校验结果**（`06 §6.7.2`）：
+    /// * `None` = 未启用 `--check-proof`、非 `unsat`、或后端无 `get-proof` 能力；
+    /// * `Some(true)` = Alethe 证明通过结构校验（含末步 `false`、无 `hole`、前提不悬空）；
+    /// * `Some(false)` = **未通过** ⇒ 该 `unsat` 不可采信，`status` 已降级为
+    ///   `UnknownReviewRequired` 并清空冲突核，同时给出 `W-PROOF-CHECK-FAILED`。
+    pub proof_checked: Option<bool>,
 }
 
 impl Check {
@@ -324,6 +330,7 @@ mod tests {
             diagnostics: vec![],
             core_minimized: true,
             refinement_class: None,
+            proof_checked: None,
         }
     }
 

@@ -170,6 +170,10 @@
         "refinement_class": {
           "oneOf": [{ "$ref": "#/$defs/RefinementClass" }, { "type": "null" }],
           "description": "refines 目标的四态分类；非 refines 目标为 null（06 §6.3.3）。"
+        },
+        "proof_checked": {
+          "oneOf": [{ "type": "boolean" }, { "type": "null" }],
+          "description": "UNSAT 证明的结构性校验结果（06 §6.7.2）。null = 未启用/非 unsat/后端无 get-proof；false 时该 unsat 不可采信且 status 已降级为 UnknownReviewRequired。"
         }
       },
       "allOf": [

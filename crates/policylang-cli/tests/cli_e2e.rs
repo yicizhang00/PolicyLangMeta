@@ -799,3 +799,44 @@ fn counterexample_interval_can_be_disabled() {
     assert!(!o.stderr.contains("panicked"), "{}", o.stderr);
     assert!(std::fs::read_to_string(&rep).is_ok(), "报告应仍被写出");
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// UNSAT 证明的结构性校验（`06 §6.7.2`）
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn check_proof_never_downgrades_when_proof_is_unavailable() {
+    // 「**无法**校验」（后端不产出 Alethe 证明）≠「校验**失败**」：
+    // 前者绝不能降级，否则装了 z3 的环境将永远得不到 Pass。
+    let d = tmp_dir("proofcheck");
+    let f = write(&d, "c.plm", CONSISTENCY_OK);
+    let rep = d.join("r.json");
+    let o = run(
+        &[
+            "verify",
+            f.to_str().unwrap(),
+            "--solvers",
+            &stub_arg(),
+            "--check-proof",
+            "--output",
+            rep.to_str().unwrap(),
+        ],
+        "sat",
+        &[],
+    );
+    assert!(!o.stderr.contains("panicked"), "{}", o.stderr);
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&rep).unwrap()).unwrap();
+    for c in r["checks"].as_array().unwrap() {
+        assert_ne!(
+            c["status"], "UnknownReviewRequired",
+            "无法校验时不得降级为 UnknownReviewRequired：{c}"
+        );
+        // 未执行校验时必须显式为 null（不伪造 true/false）
+        let pc = c.get("proof_checked").cloned().unwrap_or(serde_json::Value::Null);
+        assert!(
+            pc.is_null() || pc == serde_json::Value::Bool(true),
+            "proof_checked 不得为 false（未发生真校验失败）：{c}"
+        );
+    }
+}

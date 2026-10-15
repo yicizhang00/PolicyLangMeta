@@ -62,6 +62,8 @@ pub const W_LOGIC_FALLBACK: &str = "W-LOGIC-FALLBACK";
 pub const W_SINGLE_BACKEND: &str = "W-SINGLE-BACKEND";
 pub const W_SOLVER_MISSING: &str = "W-SOLVER-MISSING";
 pub const W_SOLVER_DRIFT: &str = "W-SOLVER-DRIFT";
+/// UNSAT 证明未通过结构校验（`06 §6.7.2`）：该 `unsat` 不可采信。
+pub const W_PROOF_CHECK_FAILED: &str = "W-PROOF-CHECK-FAILED";
 pub const W_WAIVER_EXPIRED: &str = "W-WAIVER-EXPIRED";
 pub const W_WAIVER_MALFORMED: &str = "W-WAIVER-MALFORMED";
 pub const W_SLOW_GOAL: &str = "W-SLOW-GOAL";

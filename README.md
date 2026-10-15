@@ -84,8 +84,9 @@
 
 ## 3. 快速开始
 
-**环境要求**：Rust 1.75+（`cargo`）、可选任一 SMT 求解器（`z3` / `cvc5` / `bitwuzla`）、
-可选 Lean 4 工具链（仅做形式化证明时需要）。提供 `Cargo.lock`，**可完全离线构建**。
+**环境要求**：Rust 1.75+（`cargo`）；SMT 求解器用 `bash scripts/install-solvers.sh`
+一键安装到用户目录（**无需修改 `PATH`**，也无需管理员权限）；可选 Lean 4 工具链（仅做形式化证明时需要）。
+提供 `Cargo.lock`，**可完全离线构建**。
 
 ```bash
 # 0) 构建（离线亦可；首次约 1 分钟）
@@ -145,10 +146,11 @@ SORRY_BUDGET=10 ../scripts/check-sorry.sh PolicylangProof
 
 | 项 | 值 |
 |---|---|
-| 规模 | **8 个 crate / 43 个 Rust 文件 / 15,596 行**（`policylang-{ast,parser,check,codegen,solver,diagnostics,governance,cli}`） |
-| 测试 | **161 个自动化测试全部通过**（142 单元 + 19 端到端），**0 编译告警** |
+| 规模 | **8 个 crate / 48 个 Rust 文件 / 18,898 行**（`policylang-{ast,parser,check,codegen,solver,diagnostics,governance,cli}`） |
+| 测试 | **213 个自动化测试全部通过**（186 单元 + 27 端到端），**0 编译告警** |
 | 外部依赖 | `pest` / `pest_derive` / `serde` / `serde_json` / `sha2` / `hex` / `thiserror`——均为标准生态库；**未引入** tokio / clap / regex / rfc8785（等价替换的理由见 `IMPLEMENTATION.md §6.1`） |
-| 可执行文件 | `policylang`（8 个子命令）、`pl-stub-solver`（端到端测试桩，**非真求解器**） |
+| 求解器 | **已接入真实 z3 5.3.0 / cvc5 1.4.2 / bitwuzla 0.9.1**（`bash scripts/install-solvers.sh`）；能力矩阵由 `--solvers` 实测 |
+| 可执行文件 | `policylang`（9 个子命令，含 `lock`）、`pl-stub-solver`（端到端测试桩，**非真求解器**） |
 | 详细说明 | **[`IMPLEMENTATION.md`](IMPLEMENTATION.md)** |
 
 实现过程中反向修正了规范与冻结文法中的 6 处缺陷（`INC-14`–`INC-19`，其中 `INC-18` 为**阻断性**缺陷：

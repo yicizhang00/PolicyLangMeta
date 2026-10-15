@@ -95,6 +95,7 @@ verify 选项：\n\
   --enum-encoding <int|datatype> 枚举编码（默认 int；DD-6.2 保留开关）\n\
   --no-counterexample-interval   关闭反例区间化（默认开启；06 §6.3.7）\n\
   --interval-budget <ms>         区间化总预算（默认 500）\n\
+  --check-proof                  对 unsat 追加 UNSAT 证明结构校验（06 §6.7.2）\n\
   --quiet                  不打印人类可读摘要"
         ,
         env!("CARGO_PKG_VERSION")
@@ -202,6 +203,7 @@ fn parse_verify(args: &[String]) -> Result<cmd_verify::VerifyOptions, String> {
                     }
                 };
             }
+            "--check-proof" => o.check_proof = true,
             "--counterexample-interval" => o.counterexample_interval = true,
             "--no-counterexample-interval" => o.counterexample_interval = false,
             "--interval-budget" => {

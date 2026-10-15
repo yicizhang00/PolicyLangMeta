@@ -146,6 +146,7 @@ mod tests {
             diagnostics: vec![],
             core_minimized: false,
             refinement_class: None,
+            proof_checked: None,
         }
     }
 
